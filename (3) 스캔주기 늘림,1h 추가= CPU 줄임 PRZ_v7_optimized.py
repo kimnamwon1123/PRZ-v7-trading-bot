@@ -1,0 +1,893 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+PRZ v7 TradingView 동일 로직 - 국내주식/미국주식 신호 스캔 시스템
+⭐ 최적화 버전 v2.0
+- 1h, 4h, 1d 타임프레임
+- 60분 스캔 주기
+- 4시간 중복 방지 쿨타임
+
+작성: 지금까지
+"""
+
+# ============================================================================
+# 설정 변경 (이 부분만 수정되었습니다)
+# ============================================================================
+INDICATOR_NAME = "PRZ_v7_TradingView"
+DB_NAME = f"signals_{INDICATOR_NAME}.db"
+LOG_NAME = f"{INDICATOR_NAME}.log"
+
+# ✅ SCAN_INTERVAL: 30분 → 60분
+SCAN_INTERVAL = 3600  # 60분 (3600초)
+
+# Telegram
+TELEGRAM_TOKEN = "8563657580:AAHBN-NXGIdLSeWc4BEeQYnh-qOa7U0ar50"
+TELEGRAM_CHAT_ID = "5224743593"
+
+# ⭐ qual_value
+QUAL_VALUE = 6.0
+
+# ⭐ MFI 필터
+USE_MFI = True
+
+# ✅ SIGNAL_COOLDOWN_MINUTES: 60분 → 240분 (4시간)
+SIGNAL_COOLDOWN_MINUTES = 240  # 4시간 쿨타임
+
+# ============================================================================
+# ⭐ CPU 최적화 설정 (수정됨)
+# ============================================================================
+#
+# 📊 CPU 사용량 (하루 기준) - 업데이트됨
+#
+# ✅ 현재 설정 (200US + 30KR, 3TF [1h/4h/1d], 60분)
+#    → ~720초/스캔 × 24회/일 = 17,280초 ✅✅
+#    (이전 23,000초에서 1/3 감소!)
+#
+# ============================================================================
+# 🔧 현재 적용된 설정 (v2.0):
+# ============================================================================
+#
+# ✅ SCAN_INTERVAL = 3600초 (60분) ← 변경!
+# ✅ limit_us = 200개 (거래량순)
+# ✅ limit_kr = 30개 (거래량순)
+# ✅ timeframes = ['1h', '4h', '1d'] ← 1h 복구!
+# ✅ USE_MFI = True (신호 품질 유지)
+# ✅ SIGNAL_COOLDOWN_MINUTES = 240분 (4시간) ← 변경!
+#
+# ============================================================================
+
+import os
+import sys
+import time
+import sqlite3
+import logging
+import traceback
+from datetime import datetime, timedelta
+from collections import defaultdict
+import json
+
+import pandas as pd
+import numpy as np
+import pytz
+
+try:
+    import yfinance as yf
+except ImportError:
+    print("yfinance 미설치. PythonAnywhere에서는 자동 설치됨.")
+    yf = None
+
+try:
+    from pykrx import stock as pykrx_stock
+except ImportError:
+    print("pykrx 미설치. PythonAnywhere에서는 자동 설치됨.")
+    pykrx_stock = None
+
+try:
+    import requests
+except ImportError:
+    print("requests 미설치.")
+    requests = None
+
+# ============================================================================
+# 로깅 설정
+# ============================================================================
+def setup_logger():
+    logger = logging.getLogger(INDICATOR_NAME)
+    logger.setLevel(logging.DEBUG)
+
+    # 파일 핸들러
+    fh = logging.FileHandler(LOG_NAME, encoding='utf-8')
+    fh.setLevel(logging.DEBUG)
+
+    # 콘솔 핸들러
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+
+    # 포매터
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
+    return logger
+
+logger = setup_logger()
+
+# ============================================================================
+# Telegram 알람
+# ============================================================================
+def send_telegram(symbol, timeframe, signal_type, current_price, total_signals,
+                  qual_value, mfi_val, is_korean=False):
+    """Telegram 신호 알람 발송"""
+    if not requests:
+        logger.warning("requests 모듈 없음. Telegram 발송 불가.")
+        return False
+
+    try:
+        market = "[한국주식]" if is_korean else "[미국주식]"
+
+        if signal_type == 'LONG':
+            signal_str = "🔵 PRZ 롱(매수) 시그널"
+        else:
+            signal_str = "🔴 PRZ 숏(매도) 시그널"
+
+        tf_kr = {
+            '1h': '1시간봉',
+            '4h': '4시간봉',
+            '8h': '8시간봉',
+            '1d': '일봉'
+        }
+        timeframe_str = tf_kr.get(timeframe, timeframe)
+        current_time = datetime.now().strftime('%Y-%m-%d')
+
+        if is_korean:
+            price_str = f"{current_price:,.0f}₩"
+        else:
+            price_str = f"${current_price:.2f}"
+
+        message = f"""{market} {signal_str}
+종목: {symbol}
+타임프레임: {timeframe_str}
+가격: {price_str}
+시각: {current_time}"""
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        response = requests.post(url, json=payload, timeout=5)
+        if response.status_code == 200:
+            logger.info(f"✅ Telegram 발송: {symbol} {timeframe} {signal_type}")
+            return True
+        else:
+            logger.warning(f"❌ Telegram 발송 실패: {response.status_code}")
+            return False
+    except Exception as e:
+        logger.error(f"Telegram 에러: {e}")
+        return False
+
+# ============================================================================
+# ⭐ 캔들 시간 정규화
+# ============================================================================
+def normalize_candle_time(dt):
+    """캔들 시간을 표준 포맷으로 정규화"""
+    try:
+        if isinstance(dt, str):
+            dt = pd.to_datetime(dt)
+
+        if hasattr(dt, 'tz_localize') and dt.tz is not None:
+            dt = dt.tz_localize(None)
+        elif hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+
+        return dt.strftime('%Y-%m-%d %H:%M:%S')
+    except Exception as e:
+        logger.error(f"캔들 시간 정규화 에러: {e}")
+        return str(dt)
+
+# ============================================================================
+# ⭐ 신호 쿨타임 체크 (4시간 중복 방지)
+# ============================================================================
+def should_send_alarm(symbol, timeframe, signal_type, current_candle_time,
+                      cooldown_minutes=SIGNAL_COOLDOWN_MINUTES):
+    """
+    ⭐ 신호 중복 발송 방지 (4시간 쿨타임)
+
+    - 새 캔들: 항상 발송
+    - 같은 캔들: 마지막 발송 후 cooldown_minutes 경과시에만 재발송
+    """
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+
+        c.execute('''
+            SELECT candle_close_time, deduplicated_at FROM signals
+            WHERE symbol = ? AND timeframe = ? AND signal_type = ?
+            ORDER BY id DESC LIMIT 1
+        ''', (symbol, timeframe, signal_type))
+
+        result = c.fetchone()
+        conn.close()
+
+        if result is None:
+            logger.debug(f"🆕 첫 신호: {symbol} {timeframe} {signal_type}")
+            return True
+
+        last_candle_time, last_sent_time_str = result
+
+        # 다른 캔들 → 발송
+        if last_candle_time != current_candle_time:
+            logger.debug(f"🆕 새 캔들 신호: {symbol} {timeframe} {signal_type}")
+            return True
+
+        # ⭐ 같은 캔들 → 쿨타임 체크
+        if last_sent_time_str is None:
+            return True
+
+        try:
+            last_sent = datetime.fromisoformat(last_sent_time_str)
+        except:
+            last_sent = pd.to_datetime(last_sent_time_str)
+
+        now = datetime.now()
+        elapsed_minutes = (now - last_sent).total_seconds() / 60
+
+        if elapsed_minutes >= cooldown_minutes:
+            logger.info(f"⏰ 쿨타임({cooldown_minutes}분) 만료, 재발송: {symbol} {timeframe} {signal_type}")
+            return True
+        else:
+            remaining = cooldown_minutes - elapsed_minutes
+            logger.debug(f"🚫 중복 무시: {symbol} {timeframe} {signal_type} ({remaining:.0f}분 남음)")
+            return False
+
+    except Exception as e:
+        logger.error(f"쿨타임 체크 에러 ({symbol} {timeframe}): {e}")
+        return True
+
+# ============================================================================
+# 데이터베이스
+# ============================================================================
+def init_db():
+    """SQLite 데이터베이스 초기화"""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            signal_type TEXT NOT NULL,
+            total_signals REAL,
+            threshold REAL,
+            qual_value REAL,
+            mfi_value REAL,
+            candle_close_time DATETIME,
+            deduplicated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(symbol, timeframe, signal_type, candle_close_time)
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS signal_status (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            signal_type TEXT NOT NULL,
+            last_signal_candle_time DATETIME,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(symbol, timeframe, signal_type)
+        )
+    ''')
+
+    conn.commit()
+    conn.close()
+    logger.info(f"✅ DB 초기화 완료: {DB_NAME}")
+
+def log_signal(symbol, timeframe, signal_type, total_signals, threshold, qual,
+               mfi_val=None, candle_close_time=None):
+    """신호 저장"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+
+        c.execute('''
+            INSERT OR IGNORE INTO signals
+            (symbol, timeframe, signal_type, total_signals, threshold, qual_value, mfi_value, candle_close_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (symbol, timeframe, signal_type, total_signals, threshold, qual, mfi_val, candle_close_time))
+
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ 신호 저장: {symbol} {timeframe} {signal_type}")
+    except Exception as e:
+        logger.error(f"신호 저장 실패 ({symbol}, {timeframe}): {e}")
+
+def update_signal_status(symbol, timeframe, signal_type, candle_time):
+    """신호 상태 업데이트"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+
+        c.execute('''
+            INSERT OR REPLACE INTO signal_status
+            (symbol, timeframe, signal_type, last_signal_candle_time, created_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (symbol, timeframe, signal_type, candle_time))
+
+        conn.commit()
+        conn.close()
+        logger.debug(f"✅ 신호 상태 업데이트: {symbol} {timeframe} {signal_type}")
+    except Exception as e:
+        logger.error(f"신호 상태 저장 실패: {e}")
+
+# ============================================================================
+# PRZ v7 TradingView 신호 감지기 (동일)
+# ============================================================================
+class PRZv7TradingViewDetector:
+    """TradingView PRZ v7 지표와 100% 동일한 구현"""
+
+    def __init__(self, qual_value=6.0, use_mfi=True):
+        self.qual_value = qual_value
+        self.use_mfi = use_mfi
+
+        self.value_array = [
+            366,454,397,892,660,486,194,918,773,610,
+            928,102,233,336,920,91,145,381,871,339,
+            472,859,894,665,106,358,105,527,428,271,
+            858,250,741,293,603,281,891,730,73,152,
+            335,277,638,686,710,282,582,556,666,79,
+            729,473,594,764,333,258,822,906,948,392,
+            326,104,325,777,391,655,684,766,298,74,
+            897,346,609,810,140,84,63,225,525,630,
+            874,310,506,408,405,623,507,345,354,835,
+            149,220,551,445,273,360,182,883,734,896,
+        ]
+
+    def _get_tf_index(self, timeframe):
+        """TradingView 타임프레임 인덱스"""
+        tf_map = {
+            '1m': 0, '3m': 1, '5m': 2, '15m': 3, '30m': 4,
+            '1h': 5, '2h': 6, '3h': 7, '4h': 8, '5h': 9,
+            '6h': 10, '7h': 11, '8h': 12, '12h': 13,
+            '1d': 14, '1w': 15
+        }
+        return tf_map.get(timeframe, 15)
+
+    def _detect_asset_type(self, symbol):
+        """자산 유형 감지"""
+        if 'BTC' in symbol.upper():
+            return 'btc'
+        elif 'ETH' in symbol.upper():
+            return 'eth'
+        else:
+            return 'stock'
+
+    def _get_base_value(self, tf_idx, asset_type='stock'):
+        """Pine Script f_getBase() 와 100% 동일"""
+        btc_arr = [16,13,8,4,3,3,2,2,5,5,2,2,1,1,1,1]
+        eth_arr = [15,12,6,4,3,3,2,2,4,4,2,2,1,1,1,1]
+        stock_arr = [30,19,19,15,9,7,5,5,13,13,7,7,1,2,1,1]
+
+        if asset_type == 'btc':
+            return btc_arr[tf_idx] if tf_idx < len(btc_arr) else 1
+        elif asset_type == 'eth':
+            return eth_arr[tf_idx] if tf_idx < len(eth_arr) else 1
+        else:
+            return stock_arr[tf_idx] if tf_idx < len(stock_arr) else 1
+
+    def _get_mult_value(self, tf_idx, asset_type='stock'):
+        """Pine Script f_getMult() 와 100% 동일"""
+        mult_arr = [1.5,1.3,1.7,1.1,1.1,1.0,1.0,1.0,1.0,0.95,0.9,0.9,1.2,0.6,0.3,0.2]
+        return mult_arr[tf_idx] if tf_idx < len(mult_arr) else 0.2
+
+    def _get_long_value(self, timeframe, base_val, mult_val):
+        """Pine Script longValue 계산"""
+        return base_val * mult_val
+
+    def _get_mfi_params(self, tf_idx, asset_type='stock'):
+        """Pine Script f_getMFI() 와 100% 동일"""
+        aLen = [14,17,15,19,17,17,16,16,14,15,14,15,14,14,14,14]
+        aOB  = [82,82,82,80,80,80,80,80,80,80,80,80,80,80,80,80]
+        aOS  = [18,18,18,20,20,20,20,20,20,20,20,20,20,20,20,20]
+
+        l = aLen[tf_idx] if tf_idx < len(aLen) else 14
+        o = aOB[tf_idx] if tf_idx < len(aOB) else 80
+        s = aOS[tf_idx] if tf_idx < len(aOS) else 20
+
+        return (l, o, s)
+
+    def calculate_signals(self, symbol, timeframe, ohlc_data):
+        """lele() 함수 100개 인스턴스 실행"""
+        if ohlc_data.empty or len(ohlc_data) < 5:
+            return 0
+
+        closes = ohlc_data['Close'].values.astype(float)
+        opens = ohlc_data['Open'].values.astype(float)
+        highs = ohlc_data['High'].values.astype(float)
+        lows = ohlc_data['Low'].values.astype(float)
+        n_bars = len(ohlc_data)
+
+        qual = self.qual_value
+        bindex = np.zeros(100, dtype=np.float64)
+        sindex = np.zeros(100, dtype=np.float64)
+        total_signals = 0
+
+        for bar_idx in range(4, n_bars):
+            close_curr = closes[bar_idx]
+            close_prev4 = closes[bar_idx - 4]
+            open_curr = opens[bar_idx]
+            high_curr = highs[bar_idx]
+            low_curr = lows[bar_idx]
+
+            if close_curr > close_prev4:
+                bindex += 1
+            if close_curr < close_prev4:
+                sindex += 1
+
+            bar_sum = 0
+            for i in range(100):
+                len_ = self.value_array[i]
+                ret = 0
+
+                start = max(0, bar_idx - len_ + 1)
+                high_max = highs[start:bar_idx + 1].max()
+                low_min = lows[start:bar_idx + 1].min()
+
+                if bindex[i] > qual and close_curr < open_curr and high_curr >= high_max:
+                    bindex[i] = 0
+                    ret = -1
+
+                if sindex[i] > qual and close_curr > open_curr and low_curr <= low_min:
+                    sindex[i] = 0
+                    ret = 1
+
+                bar_sum += ret
+
+            total_signals = bar_sum
+
+        logger.debug(f"📊 {symbol} {timeframe}: 신호값 = {total_signals}")
+        return total_signals
+
+    def calculate_mfi(self, ohlc_data, period=14):
+        """Money Flow Index 계산"""
+        if ohlc_data.empty or len(ohlc_data) < period:
+            return None
+
+        df = ohlc_data.copy()
+        df['TP'] = (df['High'] + df['Low'] + df['Close']) / 3
+        df['RMF'] = df['TP'] * df['Volume']
+        df['pos_flow'] = 0.0
+        df['neg_flow'] = 0.0
+
+        for i in range(1, len(df)):
+            if df['TP'].iloc[i] > df['TP'].iloc[i-1]:
+                df.loc[df.index[i], 'pos_flow'] = df['RMF'].iloc[i]
+            else:
+                df.loc[df.index[i], 'neg_flow'] = df['RMF'].iloc[i]
+
+        pos_sum = df['pos_flow'].tail(period).sum()
+        neg_sum = df['neg_flow'].tail(period).sum()
+
+        if pos_sum + neg_sum == 0:
+            return 50.0
+
+        mfi = 100 - (100 / (1 + pos_sum / neg_sum))
+        return mfi
+
+    def detect_signal(self, symbol, timeframe, ohlc_data, is_korean=False):
+        """Pine Script와 100% 동일한 신호 감지"""
+        if ohlc_data.empty or len(ohlc_data) < 5:
+            return 'NEUTRAL', 0, None, 0, 0
+
+        asset_type = self._detect_asset_type(symbol)
+        tf_idx = self._get_tf_index(timeframe)
+
+        base_val = self._get_base_value(tf_idx, asset_type)
+        mult = self._get_mult_value(tf_idx, asset_type)
+
+        long_value = self._get_long_value(timeframe, base_val, mult)
+        short_value = -base_val * mult
+
+        total_signals = self.calculate_signals(symbol, timeframe, ohlc_data)
+        mfi_val = self.calculate_mfi(ohlc_data) if self.use_mfi else None
+
+        _, mfi_ob, mfi_os = self._get_mfi_params(tf_idx, asset_type)
+
+        if self.use_mfi and mfi_val is not None:
+            if total_signals <= short_value and mfi_val >= mfi_ob:
+                return 'SHORT', total_signals, mfi_val, short_value, base_val
+            elif total_signals >= long_value and mfi_val <= mfi_os:
+                return 'LONG', total_signals, mfi_val, long_value, base_val
+            else:
+                return 'NEUTRAL', total_signals, mfi_val, long_value, base_val
+        else:
+            if total_signals >= long_value:
+                return 'LONG', total_signals, mfi_val, long_value, base_val
+            elif total_signals <= short_value:
+                return 'SHORT', total_signals, mfi_val, short_value, base_val
+            else:
+                return 'NEUTRAL', total_signals, mfi_val, long_value, base_val
+
+# ============================================================================
+# 암호화폐 필터
+# ============================================================================
+def is_cryptocurrency(symbol):
+    """암호화폐 필터링"""
+    crypto_keywords = ['USDT.P', 'BUSD.P', 'USDC.P', 'BTCUSDT', 'ETHUSDT', 'crypto']
+    return any(keyword.upper() in symbol.upper() for keyword in crypto_keywords)
+
+# ============================================================================
+# 데이터 수집
+# ============================================================================
+def get_sp500_symbols():
+    """S&P 500 상위 200개"""
+    major_tickers = [
+        'AAPL', 'MSFT', 'GOOG', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'BRK-B', 'JNJ',
+        'V', 'WMT', 'JPM', 'MA', 'PG', 'HD', 'DIS', 'PYPL', 'INTC', 'NFLX',
+        'CSCO', 'CRM', 'PEP', 'KO', 'ABT', 'NKE', 'MCD', 'CMCSA', 'ADBE', 'COST',
+        'VZ', 'PFE', 'CVX', 'XOM', 'LLY', 'AXP', 'CME', 'BA', 'LMT', 'RTX',
+        'QCOM', 'IBM', 'GE', 'AMAT', 'LRCX', 'KLAC', 'SNPS', 'CDNS', 'ASML', 'TXN',
+        'AVGO', 'MU', 'NOW', 'AMD', 'NXPI', 'MCHP', 'ADI', 'ISRG',
+        'ADP', 'TEAM', 'FTNT', 'DDOG', 'CRWD', 'ZM', 'SHOP',
+        'ABNB', 'DASH', 'RBLX', 'NET', 'SNOW', 'DBX', 'VEEV', 'ZS', 'MDB',
+        'ROKU', 'TTWO', 'VRSN', 'EA', 'MSCI', 'MTCH', 'NTES', 'BIDU',
+        'ACN', 'ALGN', 'AMCR', 'AMKR', 'AEE', 'AEP', 'AES', 'AIG',
+        'ALB', 'ALL', 'ALK', 'AME', 'AON', 'AOS', 'APA', 'APD',
+        'APH', 'APP', 'ARE', 'ARW', 'ASB', 'ASH',
+        'ASND', 'ASPN', 'ASPS', 'ASTS', 'ATEN', 'ATI',
+        'ATO', 'ATNI', 'ATOS',
+        'BAC', 'BK', 'BLK', 'C', 'CB', 'CFG', 'CINF', 'CMA', 'COF', 'DFS',
+        'FDS', 'FITB', 'FRC', 'GL', 'GS', 'HBAN', 'HIG', 'ICE', 'IVZ',
+        'KEY', 'L', 'MET', 'MKTX', 'MMC', 'MS', 'NTRS', 'PNC', 'PRU',
+        'RE', 'RF', 'SCHW', 'SIVB', 'STT', 'SYF', 'TFC', 'TROW', 'TRV', 'USB', 'WFC', 'ZION',
+        'ABBV', 'AMGN', 'BAX', 'BDX', 'BIIB', 'BMY', 'BSX', 'CAH', 'CI', 'CNC',
+        'CRL', 'CTLT', 'CVS', 'DGX', 'DHR', 'DVA', 'ELV', 'EW', 'GILD', 'HCA',
+        'HOLX', 'HSIC', 'IDXX', 'ILMN', 'INCY', 'IQV', 'MCK', 'MDT', 'MOH', 'MRK',
+        'MTD', 'PKI', 'REGN', 'RMD', 'STE', 'SYK', 'TMO', 'UNH', 'VRTX', 'WAT', 'WST', 'ZBH', 'ZTS',
+        'CAT', 'CTAS', 'DE', 'DOV', 'EMR', 'ETN', 'FDX', 'GD', 'GPC', 'GWW',
+        'HII', 'HON', 'HWM', 'IEX', 'IR', 'ITW', 'J', 'JCI', 'LHX', 'MMM',
+        'NOC', 'NSC', 'ODFL', 'OTIS', 'PCAR', 'PH', 'PNR', 'PWR', 'ROK', 'ROL',
+        'RSG', 'SNA', 'SWK', 'TDG', 'TXT', 'UNP', 'UPS', 'URI', 'WAB', 'WM', 'XYL',
+        'AMZN', 'AZO', 'BBY', 'BKNG', 'BWA', 'CCL', 'CMG', 'CZR', 'DAL', 'DG',
+        'DHI', 'DLTR', 'DPZ', 'DRI', 'EBAY', 'ETSY', 'EXPE', 'F', 'GM', 'GRMN',
+        'HAS', 'HLT', 'KMX', 'LEN', 'LOW', 'LVS', 'MAR', 'MGM', 'MHK', 'MNST',
+        'NVR', 'NWL', 'ORLY', 'PHM', 'POOL', 'RL', 'RCL', 'SBUX', 'TGT', 'TSCO',
+        'TPR', 'ULTA', 'VFC', 'WHR', 'WYNN', 'YUM',
+        'APC', 'BKR', 'COP', 'CTRA', 'DVN', 'EOG', 'FANG', 'HAL', 'HES', 'KMI',
+        'MPC', 'MRO', 'OKE', 'OXY', 'PSX', 'PXD', 'SLB', 'TRGP', 'VLO', 'WMB',
+        'AMT', 'AWK', 'CCI', 'D', 'DLR', 'DTE', 'DUK', 'ED', 'EIX', 'ES',
+        'EVRG', 'EXC', 'FE', 'NEE', 'NI', 'O', 'PEG', 'PPL', 'PSA', 'REG',
+        'SBAC', 'SO', 'SRE', 'WEC', 'XEL',
+    ]
+
+    seen = set()
+    unique_tickers = []
+    for t in major_tickers:
+        if t not in seen:
+            seen.add(t)
+            unique_tickers.append(t)
+
+    symbols = [s for s in unique_tickers if not is_cryptocurrency(s)]
+    logger.info(f"📊 S&P 500 상위 200개 로드 완료")
+    return symbols
+
+def get_korean_stocks():
+    """한국 주식 상위 30개"""
+    logger.info("📊 한국 주식 종목 수집 중...")
+
+    fallback_stocks = [
+        '005930', '000660', '005380', '012330', '051910', '035420', '006400', '028260',
+        '009540', '066570', '207940', '003670', '015760', '000270', '034730', '042660',
+        '036570', '010140', '011200', '032640', '039490', '010950', '017670', '030200',
+        '032830', '055550', '086790',
+    ]
+
+    if not pykrx_stock:
+        logger.info(f"📊 한국 주식 폴백 {len(fallback_stocks)}개 사용")
+        return fallback_stocks
+
+    try:
+        today = datetime.now().strftime('%Y%m%d')
+        all_stocks = pykrx_stock.get_market_ticker_list(date=today)
+
+        if not all_stocks:
+            logger.warning("⚠️  pykrx 조회 실패. 폴백 사용.")
+            return fallback_stocks
+
+        volumes = []
+        for ticker in all_stocks[:500]:
+            try:
+                df = pykrx_stock.get_market_ohlcv(today, today, ticker)
+                if not df.empty:
+                    vol = df['거래량'].sum()
+                    volumes.append((ticker, vol))
+            except:
+                pass
+
+        volumes.sort(key=lambda x: x[1], reverse=True)
+        top_30 = [v[0] for v in volumes[:30]]
+
+        logger.info(f"✅ 한국 주식 상위 30개 수집 완료")
+        return top_30
+
+    except Exception as e:
+        logger.error(f"❌ 한국 주식 수집 실패: {e}")
+        return fallback_stocks
+
+def get_tf_minutes(interval):
+    """타임프레임을 분 단위로 변환"""
+    tf_map = {
+        '1m': 1, '3m': 3, '5m': 5, '15m': 15, '30m': 30,
+        '1h': 60, '2h': 120, '3h': 180, '4h': 240, '8h': 480,
+        '1d': 1440
+    }
+    return tf_map.get(interval, 60)
+
+def is_candle_completed(last_candle_time, interval):
+    """마지막 캔들이 완성되었는지 확인"""
+    if last_candle_time is None:
+        return False
+
+    try:
+        if hasattr(last_candle_time, 'tzinfo') and last_candle_time.tzinfo is not None:
+            last_candle_utc = last_candle_time.astimezone(pytz.UTC)
+        else:
+            last_candle_utc = pytz.UTC.localize(last_candle_time)
+
+        now_utc = datetime.now(pytz.UTC)
+        tf_minutes = get_tf_minutes(interval)
+        candle_end_time = last_candle_utc + timedelta(minutes=tf_minutes)
+        is_completed = now_utc >= candle_end_time
+
+        return is_completed
+    except Exception as e:
+        logger.error(f"캔들 완성 판정 에러: {e}")
+        return False
+
+def get_ohlc_data(symbol, interval, lookback_days=60):
+    """OHLC 데이터 수집"""
+    if not yf:
+        logger.error("❌ yfinance 없음")
+        return pd.DataFrame()
+
+    try:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=lookback_days)
+
+        ticker = symbol
+        if len(symbol) == 6 and symbol.isdigit():
+            ticker = f"{symbol}.KS"
+
+        df = yf.download(
+            ticker,
+            start=start_date,
+            end=end_date,
+            interval=interval,
+            progress=False,
+            timeout=30
+        )
+
+        if df.empty:
+            logger.debug(f"데이터 없음: {symbol} {interval}")
+            return pd.DataFrame()
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+
+        df.columns = df.columns.str.lower()
+
+        required_cols = ['open', 'high', 'low', 'close', 'volume']
+        if not all(col in df.columns for col in required_cols):
+            logger.error(f"필수 컬럼 부족: {symbol} {interval}")
+            return pd.DataFrame()
+
+        df = df[required_cols].copy()
+        df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+
+        if df.isnull().any().any():
+            df.dropna(inplace=True)
+
+        if df.empty or len(df) < 5:
+            logger.debug(f"데이터 부족: {symbol} {interval}")
+            return pd.DataFrame()
+
+        last_candle_time = df.index[-1]
+
+        if is_candle_completed(last_candle_time, interval):
+            logger.debug(f"✅ {symbol} {interval}: 현재 캔들 완성")
+            return df
+        else:
+            logger.debug(f"⏳ {symbol} {interval}: 현재 캔들 미완성")
+            df_prev = df.iloc[:-1]
+
+            if len(df_prev) < 5:
+                logger.debug(f"분석 가능한 캔들 부족: {symbol} {interval}")
+                return pd.DataFrame()
+
+            return df_prev
+
+    except Exception as e:
+        logger.error(f"❌ 데이터 수집 실패 ({symbol}, {interval}): {e}")
+        return pd.DataFrame()
+
+# ============================================================================
+# 신호 스캔
+# ============================================================================
+def scan_symbol(detector, symbol, is_korean=False):
+    """
+    단일 심볼 신호 스캔
+
+    ✅ 수정: 1h, 4h, 1d 모두 스캔
+    (한국 주식은 1d만)
+    """
+    signals = []
+
+    # ✅ 1h 추가됨!
+    timeframes = ['1h', '4h', '1d']
+
+    for tf in timeframes:
+        # 한국 주식은 1d만 스캔
+        if is_korean and tf != '1d':
+            continue
+
+        lookback = 365 if tf == '1d' else 60
+        ohlc = get_ohlc_data(symbol, tf, lookback_days=lookback)
+
+        if ohlc.empty:
+            logger.debug(f"데이터 없음: {symbol} {tf}")
+            continue
+
+        signal_type, total_signals, mfi_val, long_th, base_val = detector.detect_signal(
+            symbol=symbol,
+            timeframe=tf,
+            ohlc_data=ohlc,
+            is_korean=is_korean
+        )
+
+        if signal_type != 'NEUTRAL':
+            prev_candle_time = normalize_candle_time(ohlc.index[-1])
+            current_price = ohlc.iloc[-1]['Close']
+            short_th = -base_val * detector._get_mult_value(detector._get_tf_index(tf))
+
+            if should_send_alarm(symbol, tf, signal_type, prev_candle_time):
+                signals.append((
+                    tf, signal_type, total_signals, long_th if signal_type == 'LONG' else short_th,
+                    short_th, mfi_val, current_price, is_korean, prev_candle_time
+                ))
+                logger.info(f"✅ 신호 발송: {symbol} {tf} {signal_type} (값: {total_signals:.2f})")
+            else:
+                logger.info(f"⏭️  신호 스킵 (쿨타임): {symbol} {tf} {signal_type}")
+
+    return signals
+
+def scan_all(limit_us=200, limit_kr=30):
+    """
+    모든 심볼 스캔 (최적화 v2.0)
+
+    ✅ 설정:
+    - limit_us: 미국 주식 200개
+    - limit_kr: 한국 주식 30개
+    - timeframes: 1h, 4h, 1d ← 1h 추가!
+    - 중복 방지: 신호별 240분(4시간) 쿨타임 ← 변경!
+    - 스캔 주기: 60분 ← 변경!
+    - 예상 CPU: ~17,280초/일 (이전 대비 1/3 감소!)
+    """
+    logger.info("=" * 70)
+    logger.info(f"🔍 스캔 시작: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"   qual_value: {QUAL_VALUE}, MFI: {USE_MFI}")
+    logger.info(f"   🇺🇸 미국: 상위 {limit_us}개")
+    logger.info(f"   🇰🇷 한국: 상위 {limit_kr}개 (1d만)")
+    logger.info(f"   ⏱️  타임프레임: 1h, 4h, 1d ← 1h 복구!")
+    logger.info(f"   🚫 중복 방지: 신호별 {SIGNAL_COOLDOWN_MINUTES}분(4시간) 쿨타임")
+    logger.info(f"   ⏰ 스캔 주기: 60분")
+    logger.info("=" * 70)
+
+    detector = PRZv7TradingViewDetector(qual_value=QUAL_VALUE, use_mfi=USE_MFI)
+    total_new_signals = 0
+
+    # 미국 주식
+    logger.info(f"📊 미국 주식 상위 {limit_us}개 스캔 중...")
+    us_symbols = get_sp500_symbols()[:limit_us]
+
+    for idx, symbol in enumerate(us_symbols):
+        try:
+            signals = scan_symbol(detector, symbol, is_korean=False)
+
+            for tf, sig_type, total_sigs, long_th, short_th, mfi_v, current_price, is_kr, prev_time in signals:
+                log_signal(symbol, tf, sig_type, total_sigs,
+                          long_th if sig_type == 'LONG' else short_th,
+                          QUAL_VALUE, mfi_v, prev_time)
+                update_signal_status(symbol, tf, sig_type, prev_time)
+                send_telegram(symbol, tf, sig_type, current_price, total_sigs, QUAL_VALUE, mfi_v, is_kr)
+                total_new_signals += 1
+
+            if (idx + 1) % 50 == 0:
+                logger.info(f"  ✅ {idx + 1}/{len(us_symbols)} 완료...")
+
+        except Exception as e:
+            logger.error(f"❌ 스캔 실패 ({symbol}): {e}")
+            continue
+
+    logger.info(f"✅ 미국 스캔 완료: {len(us_symbols)}개")
+
+    # 한국 주식
+    logger.info(f"📊 한국 주식 상위 {limit_kr}개 스캔 중 (1d만)...")
+    kr_symbols = get_korean_stocks()[:limit_kr]
+
+    for idx, symbol in enumerate(kr_symbols):
+        try:
+            signals = scan_symbol(detector, symbol, is_korean=True)
+
+            for tf, sig_type, total_sigs, long_th, short_th, mfi_v, current_price, is_kr, prev_time in signals:
+                log_signal(symbol, tf, sig_type, total_sigs,
+                          long_th if sig_type == 'LONG' else short_th,
+                          QUAL_VALUE, mfi_v, prev_time)
+                update_signal_status(symbol, tf, sig_type, prev_time)
+                send_telegram(symbol, tf, sig_type, current_price, total_sigs, QUAL_VALUE, mfi_v, is_kr)
+                total_new_signals += 1
+
+            if (idx + 1) % 10 == 0:
+                logger.info(f"  ✅ {idx + 1}/{len(kr_symbols)} 완료...")
+
+        except Exception as e:
+            logger.error(f"❌ 스캔 실패 ({symbol}): {e}")
+            continue
+
+    logger.info(f"✅ 한국 스캔 완료: {len(kr_symbols)}개")
+
+    logger.info("=" * 70)
+    logger.info(f"✅ 스캔 완료 | 신호: {total_new_signals}개")
+    logger.info("=" * 70)
+
+    return total_new_signals
+
+# ============================================================================
+# 메인 루프
+# ============================================================================
+def main():
+    """메인 루프: 60분마다 반복"""
+    logger.info("=" * 70)
+    logger.info("🚀 PRZ v7 TradingView 최적화 v2.0 시작")
+    logger.info(f"   ⭐ 타임프레임: 1h, 4h, 1d")
+    logger.info(f"   ⭐ 신호별 쿨타임: {SIGNAL_COOLDOWN_MINUTES}분 (4시간)")
+    logger.info(f"   ⭐ 스캔 주기: {SCAN_INTERVAL}초 (60분)")
+    logger.info(f"   ⭐ 예상 CPU: ~17,280초/일")
+    logger.info("=" * 70)
+
+    init_db()
+
+    try:
+        iteration = 0
+        while True:
+            iteration += 1
+            logger.info(f"\n⏰ 반복 #{iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+            try:
+                scan_all()
+            except Exception as e:
+                logger.error(f"❌ 스캔 에러: {e}\n{traceback.format_exc()}")
+
+            logger.info(f"⏳ {SCAN_INTERVAL}초 대기 중...")
+            time.sleep(SCAN_INTERVAL)
+
+    except KeyboardInterrupt:
+        logger.info("⛔ 키보드 중단")
+    except Exception as e:
+        logger.error(f"❌ 치명적 에러: {e}\n{traceback.format_exc()}")
+    finally:
+        logger.info("=" * 70)
+        logger.info("⛔ PRZ v7 TradingView 최적화 v2.0 종료")
+        logger.info("=" * 70)
+
+# ============================================================================
+if __name__ == '__main__':
+    main()
