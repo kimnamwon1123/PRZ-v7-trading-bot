@@ -1,0 +1,1677 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+PRZ v7 + 별 시그널 통합 - 국내주식/미국주식 신호 스캔 시스템
+Pine Script "PRZ v7 + 별 시그널 통합 하나의 시그널로" 100% 동일 구현
+
+⭐ 변경 사항 (기존 PRZ v7 단독 버전 대비):
+  1. 별 시그널(Star) 엔진 추가 (quals 100개, 모노토닉 스택 방식)
+  2. PRZ 시그널 + 별 시그널을 하나의 시그널로 통합
+     - raw_long  = PRZ 롱  or 별 롱
+     - raw_short = PRZ 숏  or 별 숏
+     - 같은 봉에서 롱/숏 동시 발생 시 롱 우선
+  3. DB/로그 파일명 변경 (기존 DB와 중복제거 상태 분리)
+  4. ⚡ PRZ 계산 슬라이딩 윈도우(rolling) 최적화
+     - 최고가/최저가를 pandas rolling(C 레벨)로 사전 계산 → 수십~수백 배 고속화
+     - 결과는 기존 방식과 100% 동일 (검증 완료)
+  5. ⚡ MFI 계산 벡터화 + 타임프레임별 MFI 길이 적용 (Pine f_getMFI와 동일)
+  6. 긴 히스토리 지원: 일봉 10년치, 시간봉 400일치
+     - 별 시그널의 큰 quals도 발동 가능 → 트레이딩뷰와 더 근접
+  7. ⭐ ETF 27개 추가 (SPY/QQQ/TQQQ/SOXL 등, 거래량 최상위 → 개별주보다 우선 스캔)
+작성: 지금까지
+"""
+
+import os
+##os.remove('signals_PRZ_v7_Star.db')
+import sys
+import time
+import sqlite3
+import logging
+import traceback
+from datetime import datetime, timedelta
+from collections import defaultdict
+import json
+
+import pandas as pd
+import numpy as np
+import pytz
+
+try:
+    import yfinance as yf
+except ImportError:
+    print("yfinance 미설치. PythonAnywhere에서는 자동 설치됨.")
+    yf = None
+
+try:
+    from pykrx import stock as pykrx_stock
+except ImportError:
+    print("pykrx 미설치. PythonAnywhere에서는 자동 설치됨.")
+    pykrx_stock = None
+
+try:
+    import requests
+except ImportError:
+    print("requests 미설치.")
+    requests = None
+
+# ============================================================================
+# 설정
+# ============================================================================
+INDICATOR_NAME = "PRZ_v7_Star"          # ⭐ 통합 버전 (DB/로그 새로 생성)
+DB_NAME = f"signals_{INDICATOR_NAME}.db"
+LOG_NAME = f"{INDICATOR_NAME}.log"
+#SCAN_INTERVAL = 21000  # 5시간
+SCAN_INTERVAL = 28800  # ⭐ 8시간 (28800초)
+
+# Telegram
+TELEGRAM_TOKEN = "8563657580:AAHBN-NXGIdLSeWc4BEeQYnh-qOa7U0ar50"
+# TELEGRAM_CHAT_ID = "-1004341977618"
+TELEGRAM_CHAT_ID = "5224743593"
+
+# ⭐ qual_value (PRZ 신호 정확도, 범위 2~15, 기본 6.0)
+QUAL_VALUE = 6.0
+
+# ⭐ MFI 필터 활성화 (PRZ 전용, Pine Script: useMFI = true)
+USE_MFI = True
+
+# ⭐ 별 시그널 임계값 미세조정 (Pine: tuneOffset, +면 시그널 감소 / -면 증가)
+STAR_TUNE_OFFSET = 0
+
+# ⭐ 별 시그널 표시 여부 (Pine: showStar)
+SHOW_STAR = True
+
+# ⭐ PRZ 시그널 표시 여부 (Pine: showPRZ)
+SHOW_PRZ = True
+
+# ⭐ 데이터 조회 기간 (일 단위)
+# 슬라이딩 윈도우 최적화로 긴 히스토리도 CPU 부담 없이 처리 가능
+# 히스토리가 길수록 트레이딩뷰(전체 히스토리 사용)와 신호가 더 근접함
+LOOKBACK_1D = 3650        # 일봉: 10년치 (약 2,500봉) → 별 시그널 큰 quals도 발동 가능
+LOOKBACK_INTRADAY = 400   # 1h/4h: 400일치 (yfinance 1h 한도는 730일)
+
+# ⭐ 암호화폐 (비트코인/이더리움) 스캔 설정
+# Pine Script와 동일하게 암호화폐는 PRZ 미발동, 별 시그널(Star)만 발동
+# 별 임계값도 BTC/ETH 전용 값 사용 (8h=±3, 일봉=±2)
+SCAN_CRYPTO = True
+CRYPTO_SYMBOLS = ['BTC-USD', 'ETH-USD']   # yfinance 심볼
+CRYPTO_TIMEFRAMES = ['8h', '1d']          # 8시간봉, 일봉
+# ⭐ 8h 리샘플용 1h 데이터 조회 기간
+#    720일로 설정 시 yfinance 내부 버그(_NoValueType TypeError)로 다운로드 실패
+#    → 주식 1h와 동일하게 400일로 설정 (400일 ≈ 8h봉 1,200개, 안정 동작 확인)
+CRYPTO_8H_LOOKBACK = 400
+
+# 암호화폐 이름 매핑 (텔레그램 표시용)
+CRYPTO_NAMES = {'BTC-USD': '비트코인', 'ETH-USD': '이더리움'}
+
+# ⭐ 미국주식 티커 → 한글 회사명 매핑 (텔레그램 표시용, 영어티커(한글명) 형식)
+US_STOCK_NAMES = {
+    'NVDA': '엔비디아', 'TSLA': '테슬라', 'F': '포드', 'INTC': '인텔', 'AMD': 'AMD',
+    'AAPL': '애플', 'AMZN': '아마존', 'BAC': '뱅크오브아메리카', 'MU': '마이크론', 'GM': 'GM',
+    'PFE': '화이자', 'CCL': '카니발', 'GOOGL': '알파벳A', 'GOOG': '알파벳C', 'MSFT': '마이크로소프트',
+    'META': '메타', 'WFC': '웰스파고', 'C': '씨티그룹', 'CSCO': '시스코', 'KO': '코카콜라',
+    'VZ': '버라이즌', 'XOM': '엑슨모빌', 'DIS': '디즈니', 'NFLX': '넷플릭스', 'PYPL': '페이팔',
+    'NKE': '나이키', 'WMT': '월마트', 'CMCSA': '컴캐스트', 'T': 'AT&T', 'QCOM': '퀄컴',
+    'PLTR': '팔란티어', 'SOFI': '소파이', 'UBER': '우버', 'HOOD': '로빈후드', 'SNAP': '스냅',
+    'RIVN': '리비안', 'LCID': '루시드', 'WBD': '워너브라더스', 'PLUG': '플러그파워', 'CVX': '셰브론',
+    'AVGO': '브로드컴', 'TXN': '텍사스인스트루먼트', 'ADBE': '어도비', 'CRM': '세일즈포스',
+    'AMAT': '어플라이드머티리얼즈', 'LRCX': '램리서치', 'KLAC': 'KLA', 'NXPI': 'NXP반도체',
+    'MCHP': '마이크로칩', 'ADI': '아나로그디바이스', 'ASML': 'ASML', 'SNPS': '시놉시스',
+    'CDNS': '케이던스', 'NOW': '서비스나우', 'ISRG': '인튜이티브서지컬', 'AMKR': '앰코', 'ON': '온세미',
+    'JPM': 'JP모건', 'V': '비자', 'MA': '마스터카드', 'PG': 'P&G', 'HD': '홈디포', 'JNJ': '존슨앤존슨',
+    'BRK-B': '버크셔해서웨이B', 'ABT': '애벗', 'MCD': '맥도날드', 'COST': '코스트코', 'PEP': '펩시코',
+    'ABBV': '애브비', 'AMGN': '암젠', 'MRK': '머크', 'LLY': '일라이릴리', 'AXP': '아메리칸익스프레스',
+    'CME': 'CME그룹', 'BA': '보잉', 'LMT': '록히드마틴', 'RTX': 'RTX', 'IBM': 'IBM', 'GE': 'GE',
+    'ADP': 'ADP', 'TEAM': '아틀라시안', 'FTNT': '포티넷', 'DDOG': '데이터독', 'CRWD': '크라우드스트라이크',
+    'ZM': '줌', 'SHOP': '쇼피파이', 'ABNB': '에어비앤비', 'DASH': '도어대시', 'RBLX': '로블록스',
+    'NET': '클라우드플레어', 'SNOW': '스노우플레이크', 'DBX': '드롭박스', 'VEEV': '비바시스템즈',
+    'ZS': '지스케일러', 'MDB': '몽고DB', 'ROKU': '로쿠', 'TTWO': '테이크투', 'VRSN': '베리사인',
+    'EA': 'EA', 'MSCI': 'MSCI', 'MTCH': '매치그룹', 'NTES': '넷이즈', 'BIDU': '바이두', 'APP': '앱러빈',
+    'BK': '뉴욕멜론은행', 'BLK': '블랙록', 'CB': '처브', 'CFG': '시티즌스파이낸셜', 'CINF': '신시내티파이낸셜',
+    'CMA': '코메리카', 'COF': '캐피탈원', 'DFS': '디스커버', 'FDS': '팩트셋', 'FITB': '피프스서드',
+    'GL': '글로브라이프', 'GS': '골드만삭스', 'HBAN': '헌팅턴', 'HIG': '하트포드', 'ICE': 'ICE',
+    'IVZ': '인베스코', 'KEY': '키코프', 'L': '로우스', 'MET': '메트라이프', 'MKTX': '마켓액세스',
+    'MMC': '마쉬앤맥레넌', 'MS': '모건스탠리', 'NTRS': '노던트러스트', 'PNC': 'PNC', 'PRU': '푸르덴셜',
+    'RF': '리전스파이낸셜', 'SCHW': '찰스슈왑', 'STT': '스테이트스트리트', 'SYF': '싱크로니', 'TFC': '트루이스트',
+    'TROW': 'T로우프라이스', 'TRV': '트래블러스', 'USB': 'US뱅코프', 'ZION': '자이언스',
+    'BAX': '박스터', 'BDX': '벡톤디킨슨', 'BIIB': '바이오젠', 'BMY': '브리스톨마이어스', 'BSX': '보스턴사이언티픽',
+    'CAH': '카디널헬스', 'CI': '시그나', 'CNC': '센틴', 'CRL': '찰스리버', 'CVS': 'CVS헬스',
+    'DGX': '퀘스트다이아그노스틱스', 'DHR': '다나허', 'DVA': '다비타', 'ELV': '엘레반스헬스', 'EW': '에드워즈라이프사이언스',
+    'GILD': '길리어드', 'HCA': 'HCA헬스케어', 'HOLX': '홀로직', 'HSIC': '헨리샤인', 'IDXX': '아이덱스',
+    'ILMN': '일루미나', 'INCY': '인사이트', 'IQV': '아이큐비아', 'MCK': '맥케슨', 'MDT': '메드트로닉',
+    'MOH': '몰리나헬스케어', 'MTD': '메틀러토레도', 'REGN': '리제네론', 'RMD': '레스메드', 'STE': '스테리스',
+    'SYK': '스트라이커', 'TMO': '써모피셔', 'UNH': '유나이티드헬스', 'VRTX': '버텍스', 'WAT': '워터스',
+    'WST': '웨스트파마', 'ZBH': '짐머바이오멧', 'ZTS': '조에티스',
+    'CAT': '캐터필러', 'CTAS': '신타스', 'DE': '디어', 'DOV': '도버', 'EMR': '에머슨', 'ETN': '이튼',
+    'FDX': '페덱스', 'GD': '제너럴다이내믹스', 'GPC': '제뉴인파츠', 'GWW': 'WW그레인저', 'HII': '헌팅턴잉걸스',
+    'HON': '하니웰', 'HWM': '하우멧', 'IEX': '아이덱스', 'IR': '인거솔랜드', 'ITW': '일리노이툴웍스',
+    'J': '제이콥스', 'JCI': '존슨컨트롤스', 'LHX': 'L3해리스', 'MMM': '3M', 'NOC': '노스럽그러먼',
+    'NSC': '노퍽서던', 'ODFL': '올드도미니언', 'OTIS': '오티스', 'PCAR': '팩카', 'PH': '파커하니핀',
+    'PNR': '펜테어', 'PWR': '퀀타서비스', 'ROK': '록웰오토메이션', 'ROL': '롤린스', 'RSG': '리퍼블릭서비스',
+    'SNA': '스냅온', 'SWK': '스탠리블랙앤데커', 'TDG': '트랜스다임', 'TXT': '텍스트론', 'UNP': '유니온퍼시픽',
+    'UPS': 'UPS', 'URI': '유나이티드렌탈', 'WAB': '왭텍', 'WM': '웨이스트매니지먼트', 'XYL': '자일럼',
+    'AZO': '오토존', 'BBY': '베스트바이', 'BKNG': '부킹홀딩스', 'BWA': '보그워너', 'CMG': '치폴레',
+    'CZR': '시저스', 'DAL': '델타항공', 'DG': '달러제너럴', 'DHI': 'DR호튼', 'DLTR': '달러트리',
+    'DPZ': '도미노피자', 'DRI': '다든', 'EBAY': '이베이', 'ETSY': '엣시', 'EXPE': '익스피디아',
+    'GRMN': '가민', 'HAS': '하스브로', 'HLT': '힐튼', 'KMX': '카맥스', 'LEN': '레나',
+    'LOW': '로우스', 'LVS': '라스베이거스샌즈', 'MAR': '메리어트', 'MGM': 'MGM리조트', 'MHK': '모호크',
+    'MNST': '몬스터음료', 'NVR': 'NVR', 'NWL': '뉴웰브랜즈', 'ORLY': '오라일리', 'PHM': '풀트그룹',
+    'POOL': '풀코퍼레이션', 'RL': '랄프로렌', 'RCL': '로얄캐리비안', 'SBUX': '스타벅스', 'TGT': '타겟',
+    'TSCO': '트랙터서플라이', 'TPR': '태피스트리', 'ULTA': '얼타뷰티', 'VFC': 'VF코퍼레이션', 'WHR': '월풀',
+    'WYNN': '윈리조트', 'YUM': '얌브랜즈',
+    'BKR': '베이커휴즈', 'COP': '코노코필립스', 'CTRA': '코테라에너지', 'DVN': '데본에너지', 'EOG': 'EOG리소스',
+    'FANG': '다이아몬드백', 'HAL': '핼리버튼', 'HES': '헤스', 'KMI': '킨더모건', 'MPC': '마라톤페트롤리엄',
+    'OKE': '원오크', 'OXY': '옥시덴탈', 'PSX': '필립스66', 'SLB': '슐럼버거', 'TRGP': '타겟리소스',
+    'VLO': '발레로', 'WMB': '윌리엄스',
+    'AMT': '아메리칸타워', 'AWK': '아메리칸워터웍스', 'CCI': '크라운캐슬', 'D': '도미니언에너지', 'DLR': '디지털리얼티',
+    'DTE': 'DTE에너지', 'DUK': '듀크에너지', 'ED': '콘솔리데이티드에디슨', 'EIX': '에디슨인터내셔널', 'ES': '에버소스',
+    'EVRG': '에버지', 'EXC': '엑셀론', 'FE': '퍼스트에너지', 'NEE': '넥스트에라에너지', 'NI': '니소스',
+    'O': '리얼티인컴', 'PEG': '퍼블릭서비스엔터프라이즈', 'PPL': 'PPL', 'PSA': '퍼블릭스토리지', 'REG': '리전시센터스',
+    'SBAC': 'SBA커뮤니케이션즈', 'SO': '서던컴퍼니', 'SRE': '셈프라', 'WEC': 'WEC에너지', 'XEL': '엑셀에너지',
+    'ACN': '액센츄어', 'ALGN': '얼라인테크놀로지', 'AMCR': '앰코르', 'AEE': '아메렌', 'AEP': '아메리칸일렉트릭파워',
+    'AES': 'AES', 'AIG': 'AIG', 'ALB': '앨버말', 'ALL': '올스테이트', 'ALK': '알래스카항공',
+    'AME': '아메텍', 'AON': '에이온', 'AOS': 'AO스미스', 'APA': '아파치', 'APD': '에어프로덕츠',
+    'APH': '앰페놀', 'ARE': '알렉산드리아', 'AXON': '액손', 'AXTA': '엑살타', 'ACGL': '아치캐피탈',
+    'ADSK': '오토데스크', 'AJG': '아서J갤러거', 'AVTR': '아바타', 'AZPN': '아스펜테크',
+
+    # ===== ETF (신규 추가) =====
+    # 지수형
+    'SPY': 'S&P500 ETF', 'QQQ': '나스닥100 ETF', 'IWM': '러셀2000 ETF',
+    'DIA': '다우존스 ETF', 'VOO': '뱅가드 S&P500', 'VTI': '뱅가드 미국전체',
+    # 레버리지/인버스
+    'TQQQ': '나스닥100 3배', 'SQQQ': '나스닥100 -3배',
+    'SOXL': '반도체 3배', 'SOXS': '반도체 -3배',
+    'TNA': '러셀2000 3배', 'TZA': '러셀2000 -3배',
+    'SPXL': 'S&P500 3배', 'SPXS': 'S&P500 -3배',
+    # 섹터
+    'XLF': '금융 섹터', 'XLE': '에너지 섹터', 'XLK': '기술 섹터',
+    'XLV': '헬스케어 섹터', 'XLY': '경기소비재 섹터', 'SMH': '반도체 ETF',
+    # 원자재/채권
+    'GLD': '금 ETF', 'SLV': '은 ETF', 'USO': '원유 ETF', 'TLT': '미국채20년 ETF',
+    # 신흥국/테마
+    'EEM': '신흥국 ETF', 'FXI': '중국대형주 ETF', 'ARKK': '아크 이노베이션',
+}
+
+# ⭐ 해외선물 스캔 설정 (8시간봉/일봉, PRZ + 별 둘 다 발동)
+SCAN_FUTURES = True
+FUTURES_TIMEFRAMES = ['8h', '1d']
+FUTURES_SYMBOLS = {
+    # 주가지수
+    'NQ=F':  '나스닥100선물',  'ES=F':  'S&P500선물',
+    'YM=F':  '다우존스선물',   'RTY=F': '러셀2000선물',
+    'NKD=F': '닛케이225선물',
+    # 귀금속
+    'GC=F':  '금선물',    'SI=F':  '은선물',
+    'PL=F':  '플래티넘선물', 'PA=F':  '팔라듐선물',
+    # 에너지
+    'CL=F':  'WTI원유선물', 'BZ=F':  '브렌트유선물',
+    'NG=F':  '천연가스선물', 'HO=F':  '난방유선물',
+    'RB=F':  '휘발유선물',
+    # 농산물
+    'ZC=F':  '옥수수선물', 'ZW=F':  '소맥선물',
+    'ZS=F':  '대두선물',  'KC=F':  '커피선물',
+    'CT=F':  '면화선물',  'SB=F':  '설탕선물',
+    'CC=F':  '카카오선물',
+    # 축산물
+    'LE=F':  '생우선물',  'GF=F':  '비육우선물',
+    # 외환
+    '6E=F':  '유로달러선물', '6J=F':  '엔달러선물',
+    '6B=F':  '파운드달러선물', '6A=F': '호주달러선물',
+    '6C=F':  '캐나다달러선물',
+    # 금리/채권
+    'ZB=F':  '미국채30년선물', 'ZN=F': '미국채10년선물',
+    'ZF=F':  '미국채5년선물',
+    # 원자재
+    'HG=F':  '구리선물',
+}
+
+# ============================================================================
+# 로깅 설정
+# ============================================================================
+def setup_logger():
+    logger = logging.getLogger(INDICATOR_NAME)
+    logger.setLevel(logging.DEBUG)
+
+    # 파일 핸들러
+    fh = logging.FileHandler(LOG_NAME, encoding='utf-8')
+    fh.setLevel(logging.DEBUG)
+
+    # 콘솔 핸들러
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+
+    # 포매터
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+
+    return logger
+
+logger = setup_logger()
+
+# ============================================================================
+# 한국 주식 코드 → 이름 매핑
+# ============================================================================
+KR_STOCK_NAMES = {
+    '005930': '삼성전자', '000660': 'SK하이닉스', '005935': '삼성전자우',
+    '042660': '한화오션', '373220': 'LG에너지솔루션', '035420': 'NAVER',
+    '035720': '카카오', '005380': '현대차', '000270': '기아', '051910': 'LG화학',
+    '006400': '삼성SDI', '207940': '삼성바이오로직스', '068270': '셀트리온',
+    '105560': 'KB금융', '055550': '신한지주', '086790': '하나금융지주',
+    '012330': '현대모비스', '028260': '삼성물산', '066570': 'LG전자', '015760': '한국전력',
+    '247540': '에코프로비엠', '086520': '에코프로', '196170': '알테오젠',
+    '042700': '한미반도체', '022100': '포스코DX', '000100': '유한양행',
+    '011070': 'LG이노텍', '003230': '삼양식품', '302440': 'SK바이오사이언스',
+    '064350': '현대로템', '034730': 'SK', '003670': '포스코퓨처엠',
+    '009540': 'HD한국조선해양', '010140': '삼성중공업', '011200': 'HMM',
+    '032640': 'LG유플러스', '017670': 'SK텔레콤', '030200': 'KT', '032830': '삼성생명',
+    '018260': '삼성에스디에스', '034220': 'LG디스플레이', '010130': '고려아연',
+    '036570': '엔씨소프트', '010950': 'S-Oil', '096770': 'SK이노베이션',
+    '316140': '우리금융지주', '039490': '키움증권', '034020': '두산에너빌리티',
+    '402340': 'SK스퀘어', '352820': '하이브', '018880': '한온시스템',
+    '010620': '현대미포조선', '006360': 'GS건설', '000990': 'DB하이텍',
+    '093370': '후성', '011170': '롯데케미칼', '047810': '한국항공우주',
+    '009830': '한화솔루션', '000880': '한화', '003380': '하림지주', '009070': 'KCTC',
+    '020150': '롯데에너지머티리얼즈', '006090': '사조오양', '005940': 'NH투자증권',
+    '032350': '롯데관광개발', '054380': '오르비텍', '267250': 'HD현대',
+    '051600': '한전KPS', '161390': '한국타이어앤테크놀로지', '003490': '대한항공',
+    '047050': '포스코인터내셔널', '000810': '삼성화재', '033780': 'KT&G',
+    '009150': '삼성전기',
+}
+
+_kr_name_cache = {}
+
+def get_korean_name(code):
+    """한국 주식 코드 → 이름 변환 (없으면 pykrx 조회, 그래도 없으면 코드 반환)"""
+    if code in KR_STOCK_NAMES:
+        return KR_STOCK_NAMES[code]
+    if code in _kr_name_cache:
+        return _kr_name_cache[code]
+    if pykrx_stock:
+        try:
+            name = pykrx_stock.get_market_ticker_name(code)
+            if name:
+                _kr_name_cache[code] = name
+                return name
+        except Exception:
+            pass
+    return code
+
+# ============================================================================
+# Telegram 알람
+# ============================================================================
+def send_telegram(symbol, timeframe, signal_type, current_price, total_signals,
+                  qual_value, mfi_val, is_korean=False, is_crypto=False, is_futures=False):
+    """Telegram 신호 알람 발송 (통합 시그널, 기존 포맷 유지)"""
+    if not requests:
+        logger.warning("requests 모듈 없음. Telegram 발송 불가.")
+        return False
+
+    try:
+        if is_crypto:
+            market = "[코인]"
+        elif is_futures:
+            market = "[해외선물]"
+        elif is_korean:
+            market = "[한국주식]"
+        else:
+            market = "[미국주식]"
+
+        if signal_type == 'LONG':
+            signal_str = "🔵 PRZ 롱(매수) 시그널"
+        else:
+            signal_str = "🔴 PRZ 숏(매도) 시그널"
+
+        tf_kr = {
+            '1h': '1시간봉',
+            '4h': '4시간봉',
+            '8h': '8시간봉',
+            '1d': '일봉'
+        }
+        timeframe_str = tf_kr.get(timeframe, timeframe)
+        current_date = datetime.now().strftime('%Y-%m-%d')
+
+        # ⭐ 종목 표시: <code>로 감싸면 텔레그램에서 탭 시 해당 값만 복사됨
+        if is_crypto:
+            price_str = f"${current_price:,.2f}"
+            name = CRYPTO_NAMES.get(symbol, symbol)
+            ticker = symbol.replace('-USD', '')
+            symbol_display = f"<code>{name}</code>(<code>{ticker}</code>)"
+        elif is_futures:
+            price_str = f"${current_price:,.2f}"
+            name = FUTURES_SYMBOLS.get(symbol, symbol)
+            # ⭐ 트레이딩뷰 심볼로 표시: LE=F → LE1! (탭하면 복사 → 트레이딩뷰 검색 바로 가능)
+            tv_symbol = symbol.replace('=F', '') + '1!'
+            symbol_display = f"<code>{name}</code>(<code>{tv_symbol}</code>)"
+        elif is_korean:
+            price_str = f"{current_price:,.0f}₩"
+            name = get_korean_name(symbol)
+            # 이름 탭 → 이름만 복사 / 코드 탭 → 코드만 복사
+            symbol_display = f"<code>{name}</code>(<code>{symbol}</code>)"
+        else:
+            price_str = f"${current_price:.2f}"
+            # ⭐ 영어티커(한글명) 형식. 한글명 없으면 티커만 표시
+            kr_name = US_STOCK_NAMES.get(symbol)
+            if kr_name:
+                symbol_display = f"<code>{symbol}</code>({kr_name})"
+            else:
+                symbol_display = f"<code>{symbol}</code>"
+
+        message = f"""{market} {signal_str}
+종목: {symbol_display}
+타임프레임: {timeframe_str}
+가격: {price_str}
+날짜: {current_date}"""
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        response = requests.post(url, json=payload, timeout=5)
+        if response.status_code == 200:
+            logger.info(f"✅ Telegram 발송: {symbol} {timeframe} {signal_type}")
+            return True
+        else:
+            logger.warning(f"❌ Telegram 발송 실패: {response.status_code}")
+            return False
+    except Exception as e:
+        logger.error(f"Telegram 에러: {e}")
+        return False
+
+# ============================================================================
+# 데이터베이스
+# ============================================================================
+def init_db():
+    """SQLite 데이터베이스 초기화"""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            signal_type TEXT NOT NULL,
+            total_signals REAL,
+            threshold REAL,
+            qual_value REAL,
+            mfi_value REAL,
+            star_value REAL,
+            signal_source TEXT,
+            candle_close_time DATETIME,
+            deduplicated_at DATETIME
+        )
+    ''')
+
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS signal_status (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            signal_type TEXT NOT NULL,
+            last_signal_candle_time DATETIME,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(symbol, timeframe, signal_type)
+        )
+    ''')
+
+    conn.commit()
+    conn.close()
+    logger.info(f"✅ DB 초기화 완료: {DB_NAME}")
+
+def get_last_signal_time(symbol, timeframe, signal_type):
+    """마지막 신호 시간 조회"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+
+        c.execute('''
+            SELECT last_signal_candle_time FROM signal_status
+            WHERE symbol = ? AND timeframe = ? AND signal_type = ?
+        ''', (symbol, timeframe, signal_type))
+
+        result = c.fetchone()
+        conn.close()
+
+        if result and result[0]:
+            # ⭐ 문자열 그대로 반환 (prev_candle_time 문자열과 정확히 비교 → 중복 재발송 방지)
+            #    기존엔 datetime으로 변환해 문자열과 비교 시 항상 불일치 → 8h마다 재발송되던 버그 수정
+            return result[0]
+        return None
+    except Exception as e:
+        logger.error(f"DB 조회 에러 ({symbol}, {timeframe}): {e}")
+        return None
+
+def update_signal_status(symbol, timeframe, signal_type, candle_time):
+    """신호 상태 업데이트"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+
+        c.execute('''
+            INSERT OR REPLACE INTO signal_status
+            (symbol, timeframe, signal_type, last_signal_candle_time, created_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (symbol, timeframe, signal_type, candle_time))
+
+        conn.commit()
+        conn.close()
+        logger.debug(f"✅ 신호 상태 업데이트: {symbol} {timeframe} {signal_type}")
+    except Exception as e:
+        logger.error(f"신호 상태 저장 실패: {e}")
+
+def log_signal(symbol, timeframe, signal_type, total_signals, threshold, qual,
+               mfi_val=None, star_val=None, signal_source=None, candle_close_time=None):
+    """신호 저장"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+
+        c.execute('''
+            INSERT INTO signals
+            (symbol, timeframe, signal_type, total_signals, threshold, qual_value,
+             mfi_value, star_value, signal_source, candle_close_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (symbol, timeframe, signal_type, total_signals, threshold, qual,
+              mfi_val, star_val, signal_source, candle_close_time))
+
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ 신호 저장: {symbol} {timeframe} {signal_type} (출처: {signal_source})")
+    except Exception as e:
+        logger.error(f"신호 저장 실패 ({symbol}, {timeframe}): {e}")
+
+# ============================================================================
+# PRZ v7 + 별 시그널 통합 감지기
+# ============================================================================
+class PRZv7StarDetector:
+    """
+    TradingView "PRZ v7 + 별 시그널 통합" 지표와 100% 동일한 구현
+
+    ⭐ PART 1. PRZ v7 (lele 방식, MFI 필터 포함)
+      - baseVal과 mult를 자산 유형별로 다르게 계산
+      - qual_value 입력값 지원
+      - 타임프레임별 longValue (4h/8h/1d)
+      - shortValue = -baseVal * mult
+      - allowedMarket 필터 (암호화폐 제외)
+      - MFI 필터
+
+    ⭐ PART 2. 별 시그널 (Star Indicator, 배열 최적화 방식)
+      - quals 100개 (60 ~ 6913)
+      - globalB/globalS 전역 카운터 + 인스턴스별 resetB/resetS
+      - 모노토닉 스택으로 distHigh/distLow 계산
+        (distHigh >= q  ⟺  high >= ta.highest(high, q))
+      - 타임프레임별 임계값 (주식: 1h=6, 4h=5, 일봉=3)
+
+    ⭐ PART 3. 시그널 통합
+      - raw_long  = PRZ 롱  or 별 롱
+      - raw_short = PRZ 숏  or 별 숏
+      - final_long = raw_long / final_short = raw_short and not raw_long (롱 우선)
+    """
+
+    # ⭐ 별 시그널 quals 배열 (100개, Pine Script와 동일, 오름차순 정렬 상태)
+    STAR_QUALS = [
+        60, 145, 195, 240, 298, 366, 439, 496, 610, 687,
+        810, 890, 999, 1119, 1160, 1203, 1252, 1305, 1345, 1394,
+        1440, 1503, 1551, 1600, 1660, 1682, 1760, 1840, 1893, 1931,
+        1981, 2070, 2196, 2260, 2360, 2461, 2540, 2599, 2702, 2741,
+        2780, 2791, 2881, 2902, 2950, 3011, 3100, 3141, 3196, 3219,
+        3262, 3298, 3341, 3460, 3530, 3563, 3616, 3634, 3671, 3725,
+        3803, 3841, 3876, 3893, 3915, 3958, 3999, 4090, 4119, 4162,
+        4251, 4279, 4320, 4356, 4440, 4501, 4539, 4590, 4611, 4671,
+        4710, 4780, 4810, 4832, 4870, 4905, 4921, 4956, 4975, 5020,
+        5150, 5221, 5279, 5361, 5560, 5671, 5741, 5825, 5911, 6913,
+    ]
+
+    def __init__(self, qual_value=6.0, use_mfi=True,
+                 star_tune_offset=0, show_prz=True, show_star=True):
+        self.qual_value = qual_value
+        self.use_mfi = use_mfi
+        self.star_tune_offset = star_tune_offset
+        self.show_prz = show_prz
+        self.show_star = show_star
+
+        # ⭐ PRZ value 배열 (100개, Pine Script와 동일)
+        self.value_array = [
+            366,454,397,892,660,486,194,918,773,610,
+            928,102,233,336,920,91,145,381,871,339,
+            472,859,894,665,106,358,105,527,428,271,
+            858,250,741,293,603,281,891,730,73,152,
+            335,277,638,686,710,282,582,556,666,79,
+            729,473,594,764,333,258,822,906,948,392,
+            326,104,325,777,391,655,684,766,298,74,
+            897,346,609,810,140,84,63,225,525,630,
+            874,310,506,408,405,623,507,345,354,835,
+            149,220,551,445,273,360,182,883,734,896,
+        ]
+
+    # ------------------------------------------------------------------
+    # 공통
+    # ------------------------------------------------------------------
+    def _get_tf_index(self, timeframe):
+        """TradingView 타임프레임 인덱스"""
+        tf_map = {
+            '1m': 0, '3m': 1, '5m': 2, '15m': 3, '30m': 4,
+            '1h': 5, '2h': 6, '3h': 7, '4h': 8, '5h': 9,
+            '6h': 10, '7h': 11, '8h': 12, '12h': 13,
+            '1d': 14, '1w': 15
+        }
+        return tf_map.get(timeframe, 15)
+
+    def _detect_asset_type(self, symbol):
+        """
+        자산 유형 감지 (Pine Script의 isBTC, isETH)
+        현재는 주식(stock)만 지원, 암호화폐는 필터링됨
+        """
+        if 'BTC' in symbol.upper():
+            return 'btc'
+        elif 'ETH' in symbol.upper():
+            return 'eth'
+        else:
+            return 'stock'  # 기본값
+
+    # ------------------------------------------------------------------
+    # PART 1. PRZ v7 (기존 로직 그대로)
+    # ------------------------------------------------------------------
+    def _get_base_value(self, tf_idx, asset_type='stock'):
+        """⭐ Pine Script f_getBase() 와 100% 동일"""
+        btc_arr = [16,13,8,4,3,3,2,2,5,5,2,2,1,1,1,1]
+        eth_arr = [15,12,6,4,3,3,2,2,4,4,2,2,1,1,1,1]
+        stock_arr = [30,19,19,15,9,7,5,5,13,13,7,7,1,2,1,1]
+
+        if asset_type == 'btc':
+            return btc_arr[tf_idx] if tf_idx < len(btc_arr) else 1
+        elif asset_type == 'eth':
+            return eth_arr[tf_idx] if tf_idx < len(eth_arr) else 1
+        else:  # stock (기본값)
+            return stock_arr[tf_idx] if tf_idx < len(stock_arr) else 1
+
+    def _get_mult_value(self, tf_idx, asset_type='stock'):
+        """⭐ Pine Script f_getMult() 와 100% 동일 (주식 배열 기준)"""
+        mult_arr = [1.5,1.3,1.7,1.1,1.1,1.0,1.0,1.0,1.0,0.95,0.9,0.9,1.2,0.6,0.3,0.2]
+        return mult_arr[tf_idx] if tf_idx < len(mult_arr) else 0.2
+
+    def _get_long_value(self, timeframe, base_val, mult_val):
+        """
+        ⭐ Pine Script przLongValue 계산 (타임프레임별)
+        Pine: long_4h=12.62, long_8h=1.59, long_1d=0.33 (기정의 값)
+        """
+        if timeframe == '4h':
+            return 12.62  # long_4h
+        elif timeframe == '8h':
+            return 1.59   # long_8h
+        elif timeframe == '1d':
+            return 0.33   # long_1d
+        else:
+            return base_val * mult_val
+
+    def _get_mfi_params(self, tf_idx, asset_type='stock'):
+        """⭐ Pine Script f_getMFI() 와 100% 동일"""
+        aLen = [14,17,15,19,17,17,16,16,14,15,14,15,14,14,14,14]
+        aOB  = [82,82,82,80,80,80,80,80,80,80,80,80,80,80,80,80]
+        aOS  = [18,18,18,20,20,20,20,20,20,20,20,20,20,20,20,20]
+
+        l = aLen[tf_idx] if tf_idx < len(aLen) else 14
+        o = aOB[tf_idx] if tf_idx < len(aOB) else 80
+        s = aOS[tf_idx] if tf_idx < len(aOS) else 20
+
+        return (l, o, s)
+
+    def calculate_signals(self, symbol, timeframe, ohlc_data):
+        """
+        ⭐ lele() 함수 100개 인스턴스 실행 (Pine Script와 동일)
+
+        ⚡ 슬라이딩 윈도우 최적화:
+          - 기존: 매 바 × 100개 인스턴스마다 최고가/최저가를 처음부터 다시 계산
+                  → O(바수 × 100 × 윈도우길이) = 수천만 번 연산
+          - 최적화: 100개 윈도우 길이별 rolling max/min을 pandas(C 레벨)로 사전 계산
+                    + 바 루프 안에서는 100개 인스턴스를 numpy 벡터 연산으로 일괄 처리
+                  → O(바수 × 100) 수준으로 감소 (수십~수백 배 고속)
+          - 결과는 기존 방식과 100% 동일 (동등성 검증 완료)
+        """
+        if ohlc_data.empty or len(ohlc_data) < 5:
+            return 0
+
+        closes = ohlc_data['Close'].values.astype(float)
+        opens = ohlc_data['Open'].values.astype(float)
+        highs = ohlc_data['High'].values.astype(float)
+        lows = ohlc_data['Low'].values.astype(float)
+        n_bars = len(ohlc_data)
+
+        qual = self.qual_value
+
+        # ⚡ 1단계: 100개 윈도우 길이별 rolling 최고가/최저가 사전 계산
+        #    (min_periods=1 → 기존 코드의 max(0, bar_idx - len_ + 1) 슬라이싱과 동일)
+        hs = pd.Series(highs)
+        ls = pd.Series(lows)
+        roll_max = np.empty((100, n_bars), dtype=np.float64)
+        roll_min = np.empty((100, n_bars), dtype=np.float64)
+        for i, len_ in enumerate(self.value_array):
+            roll_max[i] = hs.rolling(len_, min_periods=1).max().values
+            roll_min[i] = ls.rolling(len_, min_periods=1).min().values
+
+        # ⭐ 100개 인스턴스의 독립된 bindex/sindex
+        bindex = np.zeros(100, dtype=np.float64)
+        sindex = np.zeros(100, dtype=np.float64)
+
+        total_signals = 0
+
+        # ⚡ 2단계: 모든 바를 순서대로 처리 (인스턴스 100개는 벡터 연산으로 일괄 처리)
+        for bar_idx in range(4, n_bars):
+            close_curr = closes[bar_idx]
+            close_prev4 = closes[bar_idx - 4]
+            open_curr = opens[bar_idx]
+            high_curr = highs[bar_idx]
+            low_curr = lows[bar_idx]
+
+            # ⭐ bindex/sindex 증가 (100개 인스턴스 동시)
+            if close_curr > close_prev4:
+                bindex += 1
+            if close_curr < close_prev4:
+                sindex += 1
+
+            bar_sum = 0
+
+            # SHORT: bindex > qual AND close < open AND high >= highest
+            # LONG:  sindex > qual AND close > open AND low  <= lowest
+            # (음봉/양봉은 상호 배타적이므로 한 바에서 한쪽만 발동)
+            if close_curr < open_curr:
+                mask = (bindex > qual) & (high_curr >= roll_max[:, bar_idx])
+                if mask.any():
+                    bindex[mask] = 0
+                    bar_sum -= int(mask.sum())
+            elif close_curr > open_curr:
+                mask = (sindex > qual) & (low_curr <= roll_min[:, bar_idx])
+                if mask.any():
+                    sindex[mask] = 0
+                    bar_sum += int(mask.sum())
+
+            total_signals = bar_sum
+
+        logger.debug(f"📊 {symbol} {timeframe}: PRZ 신호값 = {total_signals}")
+        return total_signals
+
+    def calculate_mfi(self, ohlc_data, period=14):
+        """
+        Money Flow Index 계산
+        ⚡ 벡터화 최적화 (기존 행 단위 루프 → numpy 일괄 연산, 결과 동일)
+        """
+        if ohlc_data.empty or len(ohlc_data) < period:
+            return None
+
+        highs = ohlc_data['High'].values.astype(float)
+        lows = ohlc_data['Low'].values.astype(float)
+        closes = ohlc_data['Close'].values.astype(float)
+        vols = ohlc_data['Volume'].values.astype(float)
+        n = len(closes)
+
+        tp = (highs + lows + closes) / 3
+        rmf = tp * vols
+
+        pos_flow = np.zeros(n)
+        neg_flow = np.zeros(n)
+        up = tp[1:] > tp[:-1]
+        pos_flow[1:][up] = rmf[1:][up]
+        neg_flow[1:][~up] = rmf[1:][~up]
+
+        pos_sum = pos_flow[-period:].sum()
+        neg_sum = neg_flow[-period:].sum()
+
+        if pos_sum + neg_sum == 0:
+            return 50.0
+
+        mfi = 100 - (100 / (1 + pos_sum / neg_sum))
+        return mfi
+
+    # ------------------------------------------------------------------
+    # PART 2. 별 시그널 (Star Indicator)
+    # ------------------------------------------------------------------
+    def _get_star_threshold(self, timeframe, asset_type='stock'):
+        """
+        ⭐ Pine Script 타임프레임별 별 임계값 (Num_Value_*)
+        BTC/ETH: 5m=6,15m=5,30m=5,1h=5,2h=4,4h=4,6h=3,8h=3,12h=2,나머지=2
+        주식/기타: 5m=6,15m=6,30m=6,1h=6,2h=5,4h=5,6h=4,8h=4,12h=1,나머지=3
+        """
+        if asset_type in ('btc', 'eth'):
+            tf_map = {'5m': 6, '15m': 5, '30m': 5, '1h': 5, '2h': 4,
+                      '4h': 4, '6h': 3, '8h': 3, '12h': 2}
+            base = tf_map.get(timeframe, 2)   # Num_Value_remain = 2
+        else:
+            tf_map = {'5m': 6, '15m': 6, '30m': 6, '1h': 6, '2h': 5,
+                      '4h': 5, '6h': 4, '8h': 4, '12h': 1}
+            base = tf_map.get(timeframe, 3)   # Num_Value_remain = 3 (일봉 포함)
+
+        # Pine: star_long_Num := math.max(1, star_long_Num + tuneOffset)
+        return max(1, base + self.star_tune_offset)
+
+    def calculate_star(self, symbol, timeframe, ohlc_data):
+        """
+        ⭐ 별 시그널 계산 (Pine Script 배열 최적화 방식과 100% 동일)
+
+        - globalB/globalS: close > close[4] / close < close[4] 마다 증가
+        - 모노토닉 스택으로 distHigh/distLow 계산
+          distHigh = 현재 고가보다 높은 고가가 나온 마지막 바까지의 거리
+          (distHigh >= q  ⟺  high >= ta.highest(high, q) 와 동치)
+        - 음봉: quals 순회하며 q > distHigh 또는 q >= globalB 이면 break
+                globalB - resetB[i] > q 이면 resetB[i] 갱신 후 star_total -= 1
+        - 양봉: 동일하게 distLow/globalS/resetS 사용, star_total += 1
+        - 마지막 확정 캔들의 star_total 반환
+        """
+        if ohlc_data.empty or len(ohlc_data) < 5:
+            return 0
+
+        closes = ohlc_data['Close'].values.astype(float)
+        opens = ohlc_data['Open'].values.astype(float)
+        highs = ohlc_data['High'].values.astype(float)
+        lows = ohlc_data['Low'].values.astype(float)
+        n_bars = len(ohlc_data)
+
+        quals = self.STAR_QUALS
+        n_quals = len(quals)
+
+        # 인스턴스별 리셋 지점 (Pine: resetB/resetS)
+        resetB = [0] * n_quals
+        resetS = [0] * n_quals
+
+        # 전역 카운터 (Pine: globalB/globalS)
+        globalB = 0
+        globalS = 0
+
+        # 모노토닉 스택 (Pine: hVals/hIdx, lVals/lIdx)
+        hVals, hIdx = [], []
+        lVals, lIdx = [], []
+
+        INF = 2147483647
+        star_total = 0
+
+        for bar_idx in range(n_bars):
+            c = closes[bar_idx]
+            o = opens[bar_idx]
+            h = highs[bar_idx]
+            l = lows[bar_idx]
+
+            # ⭐ globalB/globalS 증가 (close[4]는 5번째 바부터 유효, Pine의 na 비교와 동일)
+            if bar_idx >= 4:
+                if c > closes[bar_idx - 4]:
+                    globalB += 1
+                if c < closes[bar_idx - 4]:
+                    globalS += 1
+
+            # ⭐ 고가 모노토닉 스택 (현재 고가 이하인 값 모두 pop)
+            while hVals and hVals[-1] <= h:
+                hVals.pop()
+                hIdx.pop()
+            distHigh = INF if not hIdx else bar_idx - hIdx[-1]
+            hVals.append(h)
+            hIdx.append(bar_idx)
+
+            # ⭐ 저가 모노토닉 스택 (현재 저가 이상인 값 모두 pop)
+            while lVals and lVals[-1] >= l:
+                lVals.pop()
+                lIdx.pop()
+            distLow = INF if not lIdx else bar_idx - lIdx[-1]
+            lVals.append(l)
+            lIdx.append(bar_idx)
+
+            # ⭐ star_total은 매 바마다 0에서 다시 계산 (Pine과 동일)
+            star_total = 0
+            is_down = c < o
+            is_up = c > o
+
+            if is_down:
+                for i in range(n_quals):
+                    q = quals[i]
+                    if q > distHigh or q >= globalB:
+                        break
+                    if globalB - resetB[i] > q:
+                        resetB[i] = globalB
+                        star_total -= 1
+
+            if is_up:
+                for i in range(n_quals):
+                    q = quals[i]
+                    if q > distLow or q >= globalS:
+                        break
+                    if globalS - resetS[i] > q:
+                        resetS[i] = globalS
+                        star_total += 1
+
+        logger.debug(f"📊 {symbol} {timeframe}: 별 신호값 = {star_total}")
+        return star_total
+
+    # ------------------------------------------------------------------
+    # PART 3. 시그널 통합
+    # ------------------------------------------------------------------
+    def detect_signal(self, symbol, timeframe, ohlc_data, is_korean=False, is_crypto=False):
+        """
+        ⭐ Pine Script와 100% 동일한 통합 신호 감지
+
+        반환: (signal_type, prz_total, mfi_val, threshold, base_val, star_total, star_th, source)
+          - signal_type: 'LONG' / 'SHORT' / 'NEUTRAL'
+          - source: 'PRZ' / 'STAR' / 'PRZ+STAR' / None
+
+        ⭐ is_crypto=True: Pine의 przAllowedMarket = not isCryptocurrency 와 동일하게
+           암호화폐는 PRZ 미발동, 별 시그널(Star)만 발동
+        """
+        if ohlc_data.empty or len(ohlc_data) < 5:
+            return 'NEUTRAL', 0, None, 0, 0, 0, 0, None
+
+        # 자산 유형 감지 (BTC-USD→'btc', ETH-USD→'eth', 그 외→'stock')
+        asset_type = self._detect_asset_type(symbol)
+        tf_idx = self._get_tf_index(timeframe)
+
+        # ═══════════ PART 1. PRZ v7 시그널 ═══════════
+        base_val = self._get_base_value(tf_idx, asset_type)
+        mult = self._get_mult_value(tf_idx, asset_type)
+
+        long_value = self._get_long_value(timeframe, base_val, mult)
+        short_value = -base_val * mult
+
+        if is_crypto:
+            # ⭐ Pine: przAllowedMarket = not isCryptocurrency → 암호화폐는 PRZ 미발동
+            # 무거운 PRZ 계산도 건너뛰어 CPU 절약 (별 시그널만 사용)
+            prz_total = 0
+            mfi_val = None
+            prz_short = False
+            prz_long = False
+        else:
+            prz_total = self.calculate_signals(symbol, timeframe, ohlc_data)
+
+            # MFI 파라미터 (⭐ Pine f_getMFI와 동일하게 타임프레임별 길이 사용, 예: 1h=17)
+            mfi_len, mfi_ob, mfi_os = self._get_mfi_params(tf_idx, asset_type)
+            mfi_val = self.calculate_mfi(ohlc_data, period=mfi_len) if self.use_mfi else None
+
+            # ⭐ Pine 조건: is_short_prz / is_long_prz
+            if self.use_mfi and mfi_val is not None:
+                prz_short = self.show_prz and (prz_total <= short_value) and (mfi_val >= mfi_ob)
+                prz_long = self.show_prz and (prz_total >= long_value) and (mfi_val <= mfi_os)
+            else:
+                prz_short = self.show_prz and (prz_total <= short_value)
+                prz_long = self.show_prz and (prz_total >= long_value)
+
+        # ⭐ Pine: PRZ 단일 시그널 통합 (동시 발생 시 롱 우선)
+        if prz_short and prz_long:
+            one_long, one_short = True, False
+        else:
+            one_long, one_short = prz_long, prz_short
+
+        # ═══════════ PART 2. 별 시그널 ═══════════
+        star_th = self._get_star_threshold(timeframe, asset_type)
+        star_total = self.calculate_star(symbol, timeframe, ohlc_data)
+
+        star_long = self.show_star and (star_total >= star_th)
+        star_short = self.show_star and (star_total <= -star_th)
+
+        # ═══════════ PART 3. 두 엔진 통합 ═══════════
+        raw_long = one_long or star_long
+        raw_short = one_short or star_short
+
+        # ⭐ 같은 봉에서 롱/숏 동시 발생 시 롱 우선 (Pine과 동일)
+        final_long = raw_long
+        final_short = raw_short and not raw_long
+
+        # 시그널 출처 기록 (로그/DB용)
+        if final_long:
+            src = []
+            if one_long:
+                src.append('PRZ')
+            if star_long:
+                src.append('STAR')
+            source = '+'.join(src)
+            return 'LONG', prz_total, mfi_val, long_value, base_val, star_total, star_th, source
+        elif final_short:
+            src = []
+            if one_short:
+                src.append('PRZ')
+            if star_short:
+                src.append('STAR')
+            source = '+'.join(src)
+            return 'SHORT', prz_total, mfi_val, short_value, base_val, star_total, star_th, source
+        else:
+            return 'NEUTRAL', prz_total, mfi_val, long_value, base_val, star_total, star_th, None
+
+# ============================================================================
+# 암호화폐 필터 (Pine Script: isCryptocurrency)
+# ============================================================================
+def is_cryptocurrency(symbol):
+    """
+    ⭐ Pine Script와 동일
+    암호화폐만 필터링 (USDT.P, BUSD.P, USDC.P, crypto)
+    """
+    crypto_keywords = ['USDT.P', 'BUSD.P', 'USDC.P', 'BTCUSDT', 'ETHUSDT', 'crypto']
+    return any(keyword.upper() in symbol.upper() for keyword in crypto_keywords)
+
+# ============================================================================
+# 데이터 수집
+# ============================================================================
+def get_sp500_symbols():
+    """
+    미국 주식 유니버스 (암호화폐 제외)
+    ⭐ 거래량(유동성) 큰 순으로 앞쪽에 배치 → CPU 한도 도달 시에도 핵심 종목 우선 스캔
+    ⭐ ETF 27개를 리스트 최상단에 배치 (SPY/QQQ/TQQQ 등은 개별주보다 거래량 큼)
+    """
+    major_tickers = [
+        # ===== ETF (거래량 최상위, 개별주보다 우선 스캔) =====
+        # 지수형
+        'SPY', 'QQQ', 'IWM', 'DIA', 'VOO', 'VTI',
+        # 레버리지/인버스 (리테일 인기)
+        'TQQQ', 'SQQQ', 'SOXL', 'SOXS', 'TNA', 'TZA', 'SPXL', 'SPXS',
+        # 섹터
+        'XLF', 'XLE', 'XLK', 'XLV', 'XLY', 'SMH',
+        # 원자재/채권
+        'GLD', 'SLV', 'USO', 'TLT',
+        # 신흥국/테마
+        'EEM', 'FXI', 'ARKK',
+
+        # ===== 초고거래량 대형주 (거래량 상위) =====
+        'NVDA', 'TSLA', 'F', 'INTC', 'AMD', 'AAPL', 'AMZN', 'BAC', 'MU', 'GM',
+        'PFE', 'CCL', 'GOOGL', 'GOOG', 'MSFT', 'META', 'WFC', 'C', 'CSCO', 'KO',
+        'VZ', 'XOM', 'DIS', 'NFLX', 'PYPL', 'NKE', 'WMT', 'CMCSA', 'T', 'QCOM',
+
+        # ===== 신규 추가 (고거래량 10종목) =====
+        'PLTR', 'SOFI', 'UBER', 'HOOD', 'SNAP', 'RIVN', 'LCID', 'WBD', 'PLUG', 'CVX',
+
+        # ===== 대형주/반도체 =====
+        'AVGO', 'TXN', 'ADBE', 'CRM', 'AMAT', 'LRCX', 'KLAC', 'NXPI', 'MCHP', 'ADI',
+        'ASML', 'SNPS', 'CDNS', 'NOW', 'ISRG', 'AMKR', 'ON',
+        'JPM', 'V', 'MA', 'PG', 'HD', 'JNJ', 'BRK-B', 'ABT', 'MCD', 'COST',
+        'PEP', 'ABBV', 'AMGN', 'MRK', 'LLY', 'AXP', 'CME', 'BA', 'LMT', 'RTX',
+        'IBM', 'GE',
+
+        # ===== 소프트웨어/성장주 =====
+        'ADP', 'TEAM', 'FTNT', 'DDOG', 'CRWD', 'ZM', 'SHOP',
+        'ABNB', 'DASH', 'RBLX', 'NET', 'SNOW', 'DBX', 'VEEV', 'ZS', 'MDB',
+        'ROKU', 'TTWO', 'VRSN', 'EA', 'MSCI', 'MTCH', 'NTES', 'BIDU', 'APP',
+
+        # ===== 금융 =====
+        'BK', 'BLK', 'CB', 'CFG', 'CINF', 'CMA', 'COF', 'DFS',
+        'FDS', 'FITB', 'GL', 'GS', 'HBAN', 'HIG', 'ICE', 'IVZ',
+        'KEY', 'L', 'MET', 'MKTX', 'MMC', 'MS', 'NTRS', 'PNC', 'PRU',
+        'RF', 'SCHW', 'STT', 'SYF', 'TFC', 'TROW', 'TRV', 'USB', 'ZION',
+
+        # ===== 헬스케어 =====
+        'BAX', 'BDX', 'BIIB', 'BMY', 'BSX', 'CAH', 'CI', 'CNC',
+        'CRL', 'CVS', 'DGX', 'DHR', 'DVA', 'ELV', 'EW', 'GILD', 'HCA',
+        'HOLX', 'HSIC', 'IDXX', 'ILMN', 'INCY', 'IQV', 'MCK', 'MDT', 'MOH',
+        'MTD', 'REGN', 'RMD', 'STE', 'SYK', 'TMO', 'UNH', 'VRTX', 'WAT', 'WST', 'ZBH', 'ZTS',
+
+        # ===== 산업재 =====
+        'CAT', 'CTAS', 'DE', 'DOV', 'EMR', 'ETN', 'FDX', 'GD', 'GPC', 'GWW',
+        'HII', 'HON', 'HWM', 'IEX', 'IR', 'ITW', 'J', 'JCI', 'LHX', 'MMM',
+        'NOC', 'NSC', 'ODFL', 'OTIS', 'PCAR', 'PH', 'PNR', 'PWR', 'ROK', 'ROL',
+        'RSG', 'SNA', 'SWK', 'TDG', 'TXT', 'UNP', 'UPS', 'URI', 'WAB', 'WM', 'XYL',
+
+        # ===== 소비재/유통 =====
+        'AZO', 'BBY', 'BKNG', 'BWA', 'CMG', 'CZR', 'DAL', 'DG',
+        'DHI', 'DLTR', 'DPZ', 'DRI', 'EBAY', 'ETSY', 'EXPE', 'GRMN',
+        'HAS', 'HLT', 'KMX', 'LEN', 'LOW', 'LVS', 'MAR', 'MGM', 'MHK', 'MNST',
+        'NVR', 'NWL', 'ORLY', 'PHM', 'POOL', 'RL', 'RCL', 'SBUX', 'TGT', 'TSCO',
+        'TPR', 'ULTA', 'VFC', 'WHR', 'WYNN', 'YUM',
+
+        # ===== 에너지 =====
+        'BKR', 'COP', 'CTRA', 'DVN', 'EOG', 'FANG', 'HAL', 'HES', 'KMI',
+        'MPC', 'OKE', 'OXY', 'PSX', 'SLB', 'TRGP', 'VLO', 'WMB',
+
+        # ===== 유틸리티 =====
+        'AMT', 'AWK', 'CCI', 'D', 'DLR', 'DTE', 'DUK', 'ED', 'EIX', 'ES',
+        'EVRG', 'EXC', 'FE', 'NEE', 'NI', 'O', 'PEG', 'PPL', 'PSA', 'REG',
+        'SBAC', 'SO', 'SRE', 'WEC', 'XEL',
+
+        # ===== 기타 =====
+        'ACN', 'ALGN', 'AMCR', 'AEE', 'AEP', 'AES', 'AIG',
+        'ALB', 'ALL', 'ALK', 'AME', 'AON', 'AOS', 'APA', 'APD',
+        'APH', 'ARE', 'AXON', 'AXTA',
+        'ACGL', 'ADSK', 'AJG', 'AVTR', 'AZPN',
+    ]
+
+    seen = set()
+    unique_tickers = []
+    for t in major_tickers:
+        if t not in seen:
+            seen.add(t)
+            unique_tickers.append(t)
+
+    symbols = [s for s in unique_tickers if not is_cryptocurrency(s)]
+    logger.info(f"📊 미국 주식/ETF {len(symbols)}개 로드 완료 (거래량 순 정렬)")
+    return symbols
+
+def get_korean_stocks():
+    """
+    한국 주식 유니버스
+    ⭐ pykrx 사용 가능 시 당일 거래량 상위로 동적 수집 (상위 60개)
+    ⭐ 폴백 리스트도 거래량(유동성) 큰 순으로 정렬
+    """
+    logger.info("📊 한국 주식 종목 수집 중...")
+
+    # 거래량(유동성) 큰 순으로 정렬된 폴백 리스트
+    fallback_stocks = [
+        # ===== 초고거래량 대형주 =====
+        '005930',  # 삼성전자
+        '000660',  # SK하이닉스
+        '005935',  # 삼성전자우
+        '042660',  # 한화오션
+        '373220',  # LG에너지솔루션
+        '035420',  # NAVER
+        '035720',  # 카카오
+        '005380',  # 현대차
+        '000270',  # 기아
+        '051910',  # LG화학
+        '006400',  # 삼성SDI
+        '207940',  # 삼성바이오로직스
+        '068270',  # 셀트리온
+        '105560',  # KB금융
+        '055550',  # 신한지주
+        '086790',  # 하나금융지주
+        '012330',  # 현대모비스
+        '028260',  # 삼성물산
+        '066570',  # LG전자
+        '015760',  # 한국전력
+
+        # ===== 신규 추가 (고거래량 10종목) =====
+        '247540',  # 에코프로비엠
+        '086520',  # 에코프로
+        '196170',  # 알테오젠
+        '042700',  # 한미반도체
+        '022100',  # 포스코DX
+        '000100',  # 유한양행
+        '011070',  # LG이노텍
+        '003230',  # 삼양식품
+        '302440',  # SK바이오사이언스
+        '064350',  # 현대로템
+
+        # ===== 대형주/코스닥 =====
+        '034730',  # SK
+        '003670',  # 포스코퓨처엠
+        '009540',  # HD한국조선해양
+        '010140',  # 삼성중공업
+        '011200',  # HMM
+        '032640',  # LG유플러스
+        '017670',  # SK텔레콤
+        '030200',  # KT
+        '032830',  # 삼성생명
+        '018260',  # 삼성에스디에스
+        '034220',  # LG디스플레이
+        '010130',  # 고려아연
+        '036570',  # 엔씨소프트
+        '010950',  # S-Oil
+        '096770',  # SK이노베이션
+        '316140',  # 우리금융지주
+        '039490',  # 키움증권
+        '034020',  # 두산에너빌리티
+        '402340',  # SK스퀘어
+        '352820',  # 하이브
+        '018880',  # 한온시스템
+        '010620',  # 현대미포조선
+        '006360',  # GS건설
+        '000990',  # DB하이텍
+        '093370',  # 후성
+        '011170',  # 롯데케미칼
+        '047810',  # 한국항공우주
+        '009830',  # 한화솔루션
+        '000880',  # 한화
+        '003380',  # 하림지주
+        '009070',  # KCTC
+        '020150',  # 롯데에너지머티리얼즈
+        '006090',  # 사조오양
+        '005940',  # NH투자증권
+        '032350',  # 롯데관광개발
+        '054380',  # 오르비텍
+        '267250',  # HD현대
+        '051600',  # 한전KPS
+        '161390',  # 한국타이어앤테크놀로지
+        '003490',  # 대한항공
+        '047050',  # 포스코인터내셔널
+        '000810',  # 삼성화재
+        '033780',  # KT&G
+        '009150',  # 삼성전기
+    ]
+
+    if not pykrx_stock:
+        logger.info(f"📊 한국 주식 폴백 {len(fallback_stocks)}개 사용 (거래량 순 정렬)")
+        return fallback_stocks
+
+    try:
+        today = datetime.now().strftime('%Y%m%d')
+        all_stocks = pykrx_stock.get_market_ticker_list(date=today)
+
+        if not all_stocks:
+            logger.warning("⚠️  pykrx 조회 실패. 폴백 사용.")
+            return fallback_stocks
+
+        volumes = []
+        for ticker in all_stocks[:500]:
+            try:
+                df = pykrx_stock.get_market_ohlcv(today, today, ticker)
+                if not df.empty:
+                    vol = df['거래량'].sum()
+                    volumes.append((ticker, vol))
+            except:
+                pass
+
+        volumes.sort(key=lambda x: x[1], reverse=True)
+        top_60 = [v[0] for v in volumes[:60]]
+
+        logger.info(f"✅ 한국 주식 거래량 상위 60개 수집 완료: {len(top_60)}개")
+        return top_60
+
+    except Exception as e:
+        logger.error(f"❌ 한국 주식 수집 실패: {e}")
+        return fallback_stocks
+
+def get_tf_minutes(interval):
+    """타임프레임을 분 단위로 변환"""
+    tf_map = {
+        '1m': 1, '3m': 3, '5m': 5, '15m': 15, '30m': 30,
+        '1h': 60, '2h': 120, '3h': 180, '4h': 240, '8h': 480,
+        '1d': 1440
+    }
+    return tf_map.get(interval, 60)
+
+def is_candle_completed(last_candle_time, interval):
+    """마지막 캔들이 완성되었는지 확인"""
+    if last_candle_time is None:
+        return False
+
+    try:
+        import pytz
+
+        if hasattr(last_candle_time, 'tzinfo') and last_candle_time.tzinfo is not None:
+            last_candle_utc = last_candle_time.astimezone(pytz.UTC)
+        else:
+            last_candle_utc = pytz.UTC.localize(last_candle_time)
+
+        now_utc = datetime.now(pytz.UTC)
+        tf_minutes = get_tf_minutes(interval)
+        candle_end_time = last_candle_utc + timedelta(minutes=tf_minutes)
+        is_completed = now_utc >= candle_end_time
+
+        logger.debug(f"캔들 상태: {last_candle_utc.strftime('%H:%M')} → {candle_end_time.strftime('%H:%M')} (현재: {now_utc.strftime('%H:%M')}) → {'✅' if is_completed else '⏳'}")
+
+        return is_completed
+    except Exception as e:
+        logger.error(f"캔들 완성 판정 에러: {e}")
+        return False
+
+def get_ohlc_data(symbol, interval, lookback_days=60):
+    """OHLC 데이터 수집"""
+    if not yf:
+        logger.error("❌ yfinance 없음")
+        return pd.DataFrame()
+
+    try:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=lookback_days)
+
+        ticker = symbol
+        if len(symbol) == 6 and symbol.isdigit():
+            ticker = f"{symbol}.KS"
+
+        yf_interval = interval
+
+        df = yf.download(
+            ticker,
+            start=start_date,
+            end=end_date,
+            interval=yf_interval,
+            progress=False,
+            timeout=30
+        )
+
+        if df.empty:
+            logger.debug(f"데이터 없음: {symbol} {interval}")
+            return pd.DataFrame()
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+
+        df.columns = df.columns.str.lower()
+
+        required_cols = ['open', 'high', 'low', 'close', 'volume']
+        if not all(col in df.columns for col in required_cols):
+            logger.error(f"필수 컬럼 부족: {symbol} {interval}")
+            return pd.DataFrame()
+
+        df = df[required_cols].copy()
+        df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+
+        if df.isnull().any().any():
+            df.dropna(inplace=True)
+
+        if df.empty or len(df) < 5:
+            logger.debug(f"데이터 부족: {symbol} {interval}")
+            return pd.DataFrame()
+
+        # ⭐ Pine Script barstate.isconfirmed 방식
+        last_candle_time = df.index[-1]
+
+        if is_candle_completed(last_candle_time, interval):
+            logger.debug(f"✅ {symbol} {interval}: 현재 캔들 완성, 포함 ({len(df)}개 바)")
+            return df
+        else:
+            logger.debug(f"⏳ {symbol} {interval}: 현재 캔들 미완성, 제외 ({len(df)-1}개 바)")
+            df_prev = df.iloc[:-1]
+
+            if len(df_prev) < 5:
+                logger.debug(f"분석 가능한 캔들 부족: {symbol} {interval}")
+                return pd.DataFrame()
+
+            return df_prev
+
+    except Exception as e:
+        logger.error(f"❌ 데이터 수집 실패 ({symbol}, {interval}): {e}")
+        return pd.DataFrame()
+
+def _resample_8h(df):
+    """
+    1시간봉 → 8시간봉 리샘플 (UTC 00:00/08:00/16:00 경계, 트레이딩뷰와 동일)
+    pandas 버전에 따라 '8h'(신) 또는 '8H'(구) 규칙 사용
+    """
+    # 인덱스를 UTC로 정규화
+    if df.index.tz is None:
+        df.index = df.index.tz_localize('UTC')
+    else:
+        df.index = df.index.tz_convert('UTC')
+
+    agg = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}
+    try:
+        out = df.resample('8h', origin='epoch').agg(agg)
+    except (ValueError, TypeError):
+        out = df.resample('8H', origin='epoch').agg(agg)
+    return out.dropna()
+
+def get_crypto_ohlc_data(symbol, tf):
+    """
+    암호화폐 OHLC 수집 (비트코인/이더리움)
+    - 1d: yfinance 일봉 직접 수집 (최대 10년치)
+    - 8h: yfinance 1h 수집 후 8시간봉으로 리샘플 (yfinance는 8h 미지원)
+    """
+    if not yf:
+        logger.error("❌ yfinance 없음")
+        return pd.DataFrame()
+
+    try:
+        end_date = datetime.now()
+
+        if tf == '1d':
+            start_date = end_date - timedelta(days=LOOKBACK_1D)
+            fetch_interval = '1d'
+        else:  # '8h' → 1h 수집 후 리샘플
+            start_date = end_date - timedelta(days=CRYPTO_8H_LOOKBACK)
+            fetch_interval = '1h'
+
+        # ⭐ 다운로드 (1h는 실패 시 기간을 절반씩 줄여 최대 3회 재시도)
+        #    yfinance는 긴 기간의 1h 요청에서 간헐적으로 실패함 (_NoValueType 버그)
+        df = pd.DataFrame()
+        attempt_days = (end_date - start_date).days
+        for attempt in range(3):
+            try:
+                df = yf.download(
+                    symbol,
+                    start=end_date - timedelta(days=attempt_days),
+                    end=end_date,
+                    interval=fetch_interval,
+                    progress=False,
+                    timeout=30
+                )
+            except Exception:
+                df = pd.DataFrame()
+
+            if df is not None and not df.empty:
+                break
+
+            if fetch_interval != '1h':
+                break  # 일봉은 재시도 불필요
+
+            attempt_days = attempt_days // 2  # 400 → 200 → 100일
+            logger.debug(f"⚠️ {symbol} {tf}: 1h 다운로드 실패, {attempt_days}일로 재시도...")
+
+        if df is None or df.empty:
+            logger.debug(f"데이터 없음: {symbol} {tf}")
+            return pd.DataFrame()
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+
+        df.columns = df.columns.str.lower()
+
+        required_cols = ['open', 'high', 'low', 'close', 'volume']
+        if not all(col in df.columns for col in required_cols):
+            logger.error(f"필수 컬럼 부족: {symbol} {tf}")
+            return pd.DataFrame()
+
+        df = df[required_cols].copy()
+        df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        df.dropna(inplace=True)
+
+        if df.empty:
+            return pd.DataFrame()
+
+        # ⭐ 8h는 1h를 리샘플
+        if tf == '8h':
+            df = _resample_8h(df)
+
+        if len(df) < 5:
+            logger.debug(f"데이터 부족: {symbol} {tf}")
+            return pd.DataFrame()
+
+        # ⭐ Pine barstate.isconfirmed 방식 (미완성 캔들 제외)
+        last_candle_time = df.index[-1]
+        if is_candle_completed(last_candle_time, tf):
+            logger.debug(f"✅ {symbol} {tf}: 현재 캔들 완성, 포함 ({len(df)}개 바)")
+            return df
+        else:
+            logger.debug(f"⏳ {symbol} {tf}: 현재 캔들 미완성, 제외 ({len(df)-1}개 바)")
+            df_prev = df.iloc[:-1]
+            if len(df_prev) < 5:
+                return pd.DataFrame()
+            return df_prev
+
+    except Exception as e:
+        logger.error(f"❌ 암호화폐 데이터 수집 실패 ({symbol}, {tf}): {e}")
+        return pd.DataFrame()
+
+# ============================================================================
+# 신호 스캔
+# ============================================================================
+def scan_symbol(detector, symbol, is_korean=False):
+    """단일 심볼 신호 스캔 (PRZ + 별 통합)"""
+    signals = []
+
+    timeframes = ['1h', '4h', '1d']
+
+    for tf in timeframes:
+        if is_korean and tf != '1d':
+            continue
+
+        # ⚡ 슬라이딩 윈도우 최적화로 긴 히스토리 사용 가능
+        lookback = LOOKBACK_1D if tf == '1d' else LOOKBACK_INTRADAY
+        ohlc = get_ohlc_data(symbol, tf, lookback_days=lookback)
+
+        if ohlc.empty:
+            logger.debug(f"데이터 없음: {symbol} {tf}")
+            continue
+
+        # ⭐ TradingView 통합 지표와 동일한 신호 감지 (PRZ + 별)
+        signal_type, prz_total, mfi_val, threshold, base_val, star_total, star_th, source = \
+            detector.detect_signal(
+                symbol=symbol,
+                timeframe=tf,
+                ohlc_data=ohlc,
+                is_korean=is_korean
+            )
+
+        if signal_type != 'NEUTRAL':
+            prev_candle_time = str(ohlc.index[-1])
+            current_price = ohlc.iloc[-1]['Close']
+
+            last_signal_time = get_last_signal_time(symbol, tf, signal_type)
+
+            if last_signal_time is None or last_signal_time != prev_candle_time:
+                signals.append((
+                    tf, signal_type, prz_total, threshold,
+                    mfi_val, star_total, source, current_price, is_korean, prev_candle_time
+                ))
+                logger.info(
+                    f"✅ 신호: {symbol} {tf} {signal_type} "
+                    f"(PRZ: {prz_total:.2f}, 별: {star_total} / ±{star_th}, 출처: {source})"
+                )
+
+    return signals
+
+def scan_crypto_symbol(detector, symbol):
+    """
+    암호화폐 단일 심볼 신호 스캔 (비트코인/이더리움)
+    ⭐ 8시간봉, 일봉만 스캔
+    ⭐ Pine과 동일하게 PRZ 미발동, 별 시그널(Star)만 사용
+    """
+    signals = []
+
+    for tf in CRYPTO_TIMEFRAMES:   # ['8h', '1d']
+        ohlc = get_crypto_ohlc_data(symbol, tf)
+
+        if ohlc.empty:
+            logger.debug(f"데이터 없음: {symbol} {tf}")
+            continue
+
+        # ⭐ is_crypto=True → PRZ 비활성화, 별 시그널만 (BTC/ETH 전용 임계값)
+        signal_type, prz_total, mfi_val, threshold, base_val, star_total, star_th, source = \
+            detector.detect_signal(
+                symbol=symbol,
+                timeframe=tf,
+                ohlc_data=ohlc,
+                is_korean=False,
+                is_crypto=True
+            )
+
+        if signal_type != 'NEUTRAL':
+            prev_candle_time = str(ohlc.index[-1])
+            current_price = ohlc.iloc[-1]['Close']
+
+            last_signal_time = get_last_signal_time(symbol, tf, signal_type)
+
+            if last_signal_time is None or last_signal_time != prev_candle_time:
+                signals.append((
+                    tf, signal_type, prz_total, threshold,
+                    mfi_val, star_total, source, current_price, prev_candle_time
+                ))
+                logger.info(
+                    f"✅ 신호: {symbol} {tf} {signal_type} "
+                    f"(별: {star_total} / ±{star_th}, 출처: {source})"
+                )
+
+    return signals
+
+def scan_futures_symbol(detector, symbol):
+    """
+    해외선물 단일 심볼 신호 스캔
+    ⭐ 8시간봉, 일봉만 스캔
+    ⭐ 주식과 동일하게 PRZ + 별 둘 다 발동 (przAllowedMarket 통과 종목)
+    """
+    signals = []
+
+    for tf in FUTURES_TIMEFRAMES:  # ['8h', '1d']
+        # 일봉은 10년치, 8h는 1h 리샘플 (암호화폐와 동일한 방식 재활용)
+        ohlc = get_crypto_ohlc_data(symbol, tf)
+
+        if ohlc.empty:
+            logger.debug(f"데이터 없음: {symbol} {tf}")
+            continue
+
+        # ⭐ is_crypto=False → PRZ + 별 둘 다 발동 (주식과 동일)
+        signal_type, prz_total, mfi_val, threshold, base_val, star_total, star_th, source = \
+            detector.detect_signal(
+                symbol=symbol,
+                timeframe=tf,
+                ohlc_data=ohlc,
+                is_korean=False,
+                is_crypto=False
+            )
+
+        if signal_type != 'NEUTRAL':
+            prev_candle_time = str(ohlc.index[-1])
+            current_price = ohlc.iloc[-1]['Close']
+
+            last_signal_time = get_last_signal_time(symbol, tf, signal_type)
+
+            if last_signal_time is None or last_signal_time != prev_candle_time:
+                signals.append((
+                    tf, signal_type, prz_total, threshold,
+                    mfi_val, star_total, source, current_price, prev_candle_time
+                ))
+                logger.info(
+                    f"✅ 신호: {symbol} {tf} {signal_type} "
+                    f"(PRZ: {prz_total:.2f}, 별: {star_total} / ±{star_th}, 출처: {source})"
+                )
+
+    return signals
+
+def scan_all():
+    """모든 심볼 스캔"""
+    logger.info("=" * 70)
+    logger.info(f"🔍 스캔 시작: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"   qual_value: {QUAL_VALUE}, MFI: {USE_MFI}, "
+                f"별 tuneOffset: {STAR_TUNE_OFFSET}, PRZ: {SHOW_PRZ}, 별: {SHOW_STAR}")
+    logger.info("=" * 70)
+
+    detector = PRZv7StarDetector(
+        qual_value=QUAL_VALUE,
+        use_mfi=USE_MFI,
+        star_tune_offset=STAR_TUNE_OFFSET,
+        show_prz=SHOW_PRZ,
+        show_star=SHOW_STAR
+    )
+    total_new_signals = 0
+
+    # 미국 주식
+    us_symbols = get_sp500_symbols()
+    logger.info(f"📊 미국 주식 {len(us_symbols)}개 스캔 중...")
+
+    for idx, symbol in enumerate(us_symbols):
+        try:
+            signals = scan_symbol(detector, symbol, is_korean=False)
+
+            for tf, sig_type, prz_total, threshold, mfi_v, star_v, source, current_price, is_kr, prev_time in signals:
+                log_signal(symbol, tf, sig_type, prz_total, threshold,
+                          QUAL_VALUE, mfi_v, star_v, source, prev_time)
+
+                update_signal_status(symbol, tf, sig_type, prev_time)
+                send_telegram(symbol, tf, sig_type, current_price, prz_total, QUAL_VALUE, mfi_v, is_kr)
+
+                total_new_signals += 1
+
+            if (idx + 1) % 50 == 0:
+                logger.info(f"  ✅ {idx + 1}/{len(us_symbols)} 완료...")
+
+        except Exception as e:
+            logger.error(f"❌ 스캔 실패 ({symbol}): {e}")
+            continue
+
+    logger.info(f"✅ 미국 스캔 완료: {len(us_symbols)}개 심볼")
+
+    # 한국 주식
+    kr_symbols = get_korean_stocks()
+    logger.info(f"📊 한국 주식 {len(kr_symbols)}개 스캔 중...")
+
+    for idx, symbol in enumerate(kr_symbols):
+        try:
+            signals = scan_symbol(detector, symbol, is_korean=True)
+
+            for tf, sig_type, prz_total, threshold, mfi_v, star_v, source, current_price, is_kr, prev_time in signals:
+                log_signal(symbol, tf, sig_type, prz_total, threshold,
+                          QUAL_VALUE, mfi_v, star_v, source, prev_time)
+
+                update_signal_status(symbol, tf, sig_type, prev_time)
+                send_telegram(symbol, tf, sig_type, current_price, prz_total, QUAL_VALUE, mfi_v, is_kr)
+
+                total_new_signals += 1
+
+            if (idx + 1) % 10 == 0:
+                logger.info(f"  ✅ {idx + 1}/{len(kr_symbols)} 완료...")
+
+        except Exception as e:
+            logger.error(f"❌ 스캔 실패 ({symbol}): {e}")
+            continue
+
+    logger.info(f"✅ 한국 스캔 완료: {len(kr_symbols)}개 심볼")
+
+    # 해외선물 - 8시간봉/일봉, PRZ + 별 둘 다
+    if SCAN_FUTURES:
+        futures_list = list(FUTURES_SYMBOLS.keys())
+        logger.info(f"📊 해외선물 {len(futures_list)}개 스캔 중 (8시간봉/일봉)...")
+
+        for symbol in futures_list:
+            try:
+                signals = scan_futures_symbol(detector, symbol)
+
+                for tf, sig_type, prz_total, threshold, mfi_v, star_v, source, current_price, prev_time in signals:
+                    log_signal(symbol, tf, sig_type, prz_total, threshold,
+                              QUAL_VALUE, mfi_v, star_v, source, prev_time)
+
+                    update_signal_status(symbol, tf, sig_type, prev_time)
+                    send_telegram(symbol, tf, sig_type, current_price, prz_total,
+                                  QUAL_VALUE, mfi_v, is_korean=False, is_crypto=False, is_futures=True)
+
+                    total_new_signals += 1
+
+            except Exception as e:
+                logger.error(f"❌ 해외선물 스캔 실패 ({symbol}): {e}")
+                continue
+
+        logger.info(f"✅ 해외선물 스캔 완료: {len(futures_list)}개 심볼")
+
+    # 암호화폐 (비트코인/이더리움) - 8시간봉/일봉, 별 시그널만
+    if SCAN_CRYPTO:
+        logger.info(f"📊 암호화폐 {len(CRYPTO_SYMBOLS)}개 스캔 중 (8시간봉/일봉, 별 시그널)...")
+
+        for symbol in CRYPTO_SYMBOLS:
+            try:
+                signals = scan_crypto_symbol(detector, symbol)
+
+                for tf, sig_type, prz_total, threshold, mfi_v, star_v, source, current_price, prev_time in signals:
+                    log_signal(symbol, tf, sig_type, prz_total, threshold,
+                              QUAL_VALUE, mfi_v, star_v, source, prev_time)
+
+                    update_signal_status(symbol, tf, sig_type, prev_time)
+                    send_telegram(symbol, tf, sig_type, current_price, prz_total,
+                                  QUAL_VALUE, mfi_v, is_korean=False, is_crypto=True)
+
+                    total_new_signals += 1
+
+            except Exception as e:
+                logger.error(f"❌ 암호화폐 스캔 실패 ({symbol}): {e}")
+                continue
+
+        logger.info(f"✅ 암호화폐 스캔 완료: {len(CRYPTO_SYMBOLS)}개 심볼")
+
+    logger.info("=" * 70)
+    logger.info(f"✅ 스캔 완료 | 신호: {total_new_signals}개")
+    logger.info("=" * 70)
+
+    return total_new_signals
+
+# ============================================================================
+# 메인 루프
+# ============================================================================
+def main():
+    """메인 루프: 8시간마다 반복"""
+    logger.info("=" * 70)
+    logger.info("🚀 PRZ v7 + 별 시그널 통합 버전 시작")
+    logger.info(f"   스캔주기: {SCAN_INTERVAL}초 ({SCAN_INTERVAL // 3600}시간)")
+    logger.info("=" * 70)
+
+    init_db()
+
+    try:
+        iteration = 0
+        while True:
+            iteration += 1
+            logger.info(f"\n⏰ 반복 #{iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+            try:
+                scan_all()
+            except Exception as e:
+                logger.error(f"❌ 스캔 에러: {e}\n{traceback.format_exc()}")
+
+            logger.info(f"⏳ {SCAN_INTERVAL}초({SCAN_INTERVAL // 3600}시간) 대기 중...")
+            time.sleep(SCAN_INTERVAL)
+
+    except KeyboardInterrupt:
+        logger.info("⛔ 키보드 중단")
+    except Exception as e:
+        logger.error(f"❌ 치명적 에러: {e}\n{traceback.format_exc()}")
+    finally:
+        logger.info("=" * 70)
+        logger.info("⛔ PRZ v7 + 별 시그널 통합 버전 종료")
+        logger.info("=" * 70)
+
+# ============================================================================
+if __name__ == '__main__':
+    main()
