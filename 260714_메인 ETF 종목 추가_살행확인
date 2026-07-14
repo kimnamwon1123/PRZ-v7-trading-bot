@@ -93,7 +93,9 @@ LOOKBACK_INTRADAY = 400   # 1h/4h: 400일치 (yfinance 1h 한도는 730일)
 # Pine Script와 동일하게 암호화폐는 PRZ 미발동, 별 시그널(Star)만 발동
 # 별 임계값도 BTC/ETH 전용 값 사용 (8h=±3, 일봉=±2)
 SCAN_CRYPTO = True
-CRYPTO_SYMBOLS = ['BTC-USD', 'ETH-USD']   # yfinance 심볼
+# ⭐ 메이저 코인 8개 (거래량/시총 상위, yfinance 심볼)
+CRYPTO_SYMBOLS = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD',
+                  'BNB-USD', 'DOGE-USD', 'ADA-USD', 'LINK-USD']
 CRYPTO_TIMEFRAMES = ['8h', '1d']          # 8시간봉, 일봉
 # ⭐ 8h 리샘플용 1h 데이터 조회 기간
 #    720일로 설정 시 yfinance 내부 버그(_NoValueType TypeError)로 다운로드 실패
@@ -101,7 +103,11 @@ CRYPTO_TIMEFRAMES = ['8h', '1d']          # 8시간봉, 일봉
 CRYPTO_8H_LOOKBACK = 400
 
 # 암호화폐 이름 매핑 (텔레그램 표시용)
-CRYPTO_NAMES = {'BTC-USD': '비트코인', 'ETH-USD': '이더리움'}
+CRYPTO_NAMES = {
+    'BTC-USD': '비트코인', 'ETH-USD': '이더리움', 'SOL-USD': '솔라나',
+    'XRP-USD': '리플', 'BNB-USD': '바이낸스코인', 'DOGE-USD': '도지코인',
+    'ADA-USD': '에이다', 'LINK-USD': '체인링크',
+}
 
 # ⭐ 미국주식 티커 → 한글 회사명 매핑 (텔레그램 표시용, 영어티커(한글명) 형식)
 US_STOCK_NAMES = {
@@ -189,10 +195,38 @@ US_STOCK_NAMES = {
     'GLD': '금 ETF', 'SLV': '은 ETF', 'USO': '원유 ETF', 'TLT': '미국채20년 ETF',
     # 신흥국/테마
     'EEM': '신흥국 ETF', 'FXI': '중국대형주 ETF', 'ARKK': '아크 이노베이션',
+
+    # ===== 신규 추가 개별주 34개 (거래량 상위) =====
+    # 대형 기술/반도체
+    'ORCL': '오라클', 'TSM': 'TSMC', 'MRVL': '마벨테크놀로지', 'SMCI': '슈퍼마이크로',
+    'ARM': '암홀딩스', 'DELL': '델', 'HPQ': 'HP',
+    # 중국 ADR
+    'BABA': '알리바바', 'JD': '징동닷컴', 'PDD': '핀둬둬',
+    'NIO': '니오', 'XPEV': '샤오펑', 'LI': '리오토',
+    # 크립토 관련주
+    'COIN': '코인베이스', 'MSTR': '마이크로스트래티지', 'MARA': '마라톤디지털', 'RIOT': '라이엇플랫폼스',
+    # 핀테크/성장주
+    'AFRM': '어펌', 'DKNG': '드래프트킹스', 'LYFT': '리프트', 'PINS': '핀터레스트',
+    'U': '유니티', 'CHWY': '츄이',
+    # 항공
+    'AAL': '아메리칸항공', 'UAL': '유나이티드항공', 'LUV': '사우스웨스트항공',
+    # 원자재/광산
+    'FCX': '프리포트맥모란', 'NEM': '뉴몬트', 'GOLD': '배릭골드', 'AA': '알코아',
+    'CLF': '클리블랜드클리프스', 'VALE': '발레', 'PBR': '페트로브라스',
+    # 소비재
+    'KHC': '크래프트하인즈',
+
+    # ===== 신규 추가 개별주 20개 (해외선물 대체) =====
+    'VRT': '버티브', 'ANET': '아리스타네트웍스', 'CEG': '컨스텔레이션에너지', 'VST': '비스트라',
+    'STX': '씨게이트', 'WDC': '웨스턴디지털', 'GLW': '코닝', 'SWKS': '스카이웍스',
+    'TER': '테라다인', 'HPE': 'HP엔터프라이즈',
+    'CPNG': '쿠팡', 'SPOT': '스포티파이', 'GRAB': '그랩', 'MRNA': '모더나',
+    'KVUE': '켄뷰', 'MDLZ': '몬델리즈', 'CL': '콜게이트', 'KMB': '킴벌리클라크', 'GIS': '제너럴밀스',
+    'CSX': 'CSX',
 }
 
-# ⭐ 해외선물 스캔 설정 (8시간봉/일봉, PRZ + 별 둘 다 발동)
-SCAN_FUTURES = True
+# ⭐ 해외선물 스캔 설정 (⛔ 비활성화 — 다시 켜려면 True로 변경)
+SCAN_FUTURES = False
 FUTURES_TIMEFRAMES = ['8h', '1d']
 FUTURES_SYMBOLS = {
     # 주가지수
@@ -282,6 +316,15 @@ KR_STOCK_NAMES = {
     '051600': '한전KPS', '161390': '한국타이어앤테크놀로지', '003490': '대한항공',
     '047050': '포스코인터내셔널', '000810': '삼성화재', '033780': 'KT&G',
     '009150': '삼성전기',
+    '005490': 'POSCO홀딩스', '012450': '한화에어로스페이스', '323410': '카카오뱅크',
+    '377300': '카카오페이', '259960': '크래프톤', '329180': 'HD현대중공업',
+    '042670': 'HD현대인프라코어', '004020': '현대제철', '036460': '한국가스공사',
+    '000720': '현대건설', '272210': '한화시스템', '079550': 'LIG넥스원',
+    '010120': 'LS일렉트릭', '000150': '두산', '454910': '두산로보틱스',
+    '112610': '씨에스윈드', '006800': '미래에셋증권', '071050': '한국금융지주',
+    '024110': '기업은행', '138040': '메리츠금융지주',
+    '086280': '현대글로비스', '090430': '아모레퍼시픽', '097950': 'CJ제일제당',
+    '128940': '한미약품', '011780': '금호석유', '241560': '두산밥캣',
 }
 
 _kr_name_cache = {}
@@ -904,7 +947,9 @@ class PRZv7StarDetector:
             one_long, one_short = prz_long, prz_short
 
         # ═══════════ PART 2. 별 시그널 ═══════════
-        star_th = self._get_star_threshold(timeframe, asset_type)
+        # ⭐ 신규 코인(SOL/XRP 등)도 BTC/ETH와 동일한 암호화폐 임계값 사용
+        star_asset = 'btc' if is_crypto else asset_type
+        star_th = self._get_star_threshold(timeframe, star_asset)
         star_total = self.calculate_star(symbol, timeframe, ohlc_data)
 
         star_long = self.show_star and (star_total >= star_th)
@@ -1030,6 +1075,34 @@ def get_sp500_symbols():
         'ALB', 'ALL', 'ALK', 'AME', 'AON', 'AOS', 'APA', 'APD',
         'APH', 'ARE', 'AXON', 'AXTA',
         'ACGL', 'ADSK', 'AJG', 'AVTR', 'AZPN',
+
+        # ===== 신규 추가 개별주 34개 (거래량 상위, 안전 대형주 위주) =====
+        # 대형 기술/반도체
+        'ORCL', 'TSM', 'MRVL', 'SMCI', 'ARM', 'DELL', 'HPQ',
+        # 중국 ADR
+        'BABA', 'JD', 'PDD', 'NIO', 'XPEV', 'LI',
+        # 크립토 관련주
+        'COIN', 'MSTR', 'MARA', 'RIOT',
+        # 핀테크/성장주
+        'AFRM', 'DKNG', 'LYFT', 'PINS', 'U', 'CHWY',
+        # 항공
+        'AAL', 'UAL', 'LUV',
+        # 원자재/광산
+        'FCX', 'NEM', 'GOLD', 'AA', 'CLF', 'VALE', 'PBR',
+        # 소비재
+        'KHC',
+
+        # ===== 신규 추가 개별주 20개 (해외선물 대체, 안전 대형주) =====
+        # AI 인프라/데이터센터
+        'VRT', 'ANET', 'CEG', 'VST',
+        # 스토리지/반도체 장비
+        'STX', 'WDC', 'GLW', 'SWKS', 'TER', 'HPE',
+        # 한국인 친숙 성장주
+        'CPNG', 'SPOT', 'GRAB', 'MRNA',
+        # 필수소비재 (안정)
+        'KVUE', 'MDLZ', 'CL', 'KMB', 'GIS',
+        # 철도
+        'CSX',
     ]
 
     seen = set()
@@ -1046,7 +1119,7 @@ def get_sp500_symbols():
 def get_korean_stocks():
     """
     한국 주식 유니버스
-    ⭐ pykrx 사용 가능 시 당일 거래량 상위로 동적 수집 (상위 60개)
+    ⭐ pykrx 사용 가능 시 당일 거래량 상위로 동적 수집 (상위 86개)
     ⭐ 폴백 리스트도 거래량(유동성) 큰 순으로 정렬
     """
     logger.info("📊 한국 주식 종목 수집 중...")
@@ -1132,6 +1205,36 @@ def get_korean_stocks():
         '000810',  # 삼성화재
         '033780',  # KT&G
         '009150',  # 삼성전기
+
+        # ===== 신규 추가 20종목 (거래량 상위 KOSPI, 500개 유니버스 확장) =====
+        '005490',  # POSCO홀딩스
+        '012450',  # 한화에어로스페이스
+        '323410',  # 카카오뱅크
+        '377300',  # 카카오페이
+        '259960',  # 크래프톤
+        '329180',  # HD현대중공업
+        '042670',  # HD현대인프라코어
+        '004020',  # 현대제철
+        '036460',  # 한국가스공사
+        '000720',  # 현대건설
+        '272210',  # 한화시스템
+        '079550',  # LIG넥스원
+        '010120',  # LS일렉트릭
+        '000150',  # 두산
+        '454910',  # 두산로보틱스
+        '112610',  # 씨에스윈드
+        '006800',  # 미래에셋증권
+        '071050',  # 한국금융지주
+        '024110',  # 기업은행
+        '138040',  # 메리츠금융지주
+
+        # ===== 신규 추가 6종목 (해외선물 대체, KOSPI 거래량 상위) =====
+        '086280',  # 현대글로비스
+        '090430',  # 아모레퍼시픽
+        '097950',  # CJ제일제당
+        '128940',  # 한미약품
+        '011780',  # 금호석유
+        '241560',  # 두산밥캣
     ]
 
     if not pykrx_stock:
@@ -1157,10 +1260,10 @@ def get_korean_stocks():
                 pass
 
         volumes.sort(key=lambda x: x[1], reverse=True)
-        top_60 = [v[0] for v in volumes[:60]]
+        top_86 = [v[0] for v in volumes[:86]]
 
-        logger.info(f"✅ 한국 주식 거래량 상위 60개 수집 완료: {len(top_60)}개")
-        return top_60
+        logger.info(f"✅ 한국 주식 거래량 상위 86개 수집 완료: {len(top_86)}개")
+        return top_86
 
     except Exception as e:
         logger.error(f"❌ 한국 주식 수집 실패: {e}")
