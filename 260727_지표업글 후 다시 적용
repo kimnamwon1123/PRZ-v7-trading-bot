@@ -18,7 +18,7 @@ Pine Script "WONEY PRZ STELLAR 실전v3" 100% 동일 구현
   6. 긴 히스토리 지원: 일봉 10년치, 시간봉(1h/8h용) 400일치
      - 별 시그널의 큰 quals도 발동 가능 → 트레이딩뷰와 더 근접
   7. ⭐ ETF 27개 추가 (SPY/QQQ/TQQQ/SOXL 등, 거래량 최상위 → 개별주보다 우선 스캔)
-  8. ⭐⭐ 미국 일반주식 8h/1d 스캔 (1h 제거 후 4h→8h 변경, 1h 수집→8h 리샘플)
+  8. ⭐⭐ 미국주식 일봉 전용 스캔 (1h/4h 제거, 8h는 TV와 봉 경계 불일치로 제외)
   9. ⭐⭐ 일봉 전용 추가 종목 40개 신설 (안전 대형주/ETF, 1d만 스캔 + 텔레그램 알람)
  10. ⭐⭐⭐ [실전v3] 롱 정확도 필터 추가 (Pine PART 2.5와 동일)
      - 거래량 필터 (롱/숏): volume >= sma(volume,20) × volMult
@@ -72,8 +72,8 @@ SCAN_INTERVAL = 28800  # ⭐ 8시간 (28800초)
 
 # Telegram
 TELEGRAM_TOKEN = "8563657580:AAHBN-NXGIdLSeWc4BEeQYnh-qOa7U0ar50"
-# TELEGRAM_CHAT_ID = "-1004341977618"
-TELEGRAM_CHAT_ID = "5224743593"
+TELEGRAM_CHAT_ID = "-1004341977618"
+# TELEGRAM_CHAT_ID = "5224743593"
 
 # ⭐ qual_value (PRZ 신호 정확도, 범위 2~15, 기본 6.0)
 QUAL_VALUE = 6.0
@@ -2009,8 +2009,10 @@ def scan_symbol(detector, symbol, is_korean=False, daily_only=False):
         logger.debug(f"🚫 차단 종목 스캔 생략: {symbol}")
         return signals
 
-    # ⭐⭐ 미국 일반주식은 8h/1d 스캔 (4h→8h 변경) + 일봉 전용 종목은 1d만 스캔
-    timeframes = ['1d'] if daily_only else ['8h', '1d']
+    # ⭐⭐ 미국주식은 일봉만 스캔
+    #     (1h→8h 리샘플은 정규장 6.5시간을 UTC 경계로 3h+4h로 쪼개
+    #      트레이딩뷰 8시간봉과 다른 봉이 만들어져 제거함)
+    timeframes = ['1d']
 
     for tf in timeframes:
         if is_korean and tf != '1d':
@@ -2170,7 +2172,7 @@ def scan_all():
 
     # 미국 주식 (⭐⭐ 8h/1d 스캔, 4h→8h 변경)
     us_symbols = get_sp500_symbols()
-    logger.info(f"📊 미국 주식 {len(us_symbols)}개 스캔 중 (8h/1d)...")
+    logger.info(f"📊 미국 주식 {len(us_symbols)}개 스캔 중 (일봉만)...")
 
     for idx, symbol in enumerate(us_symbols):
         try:
