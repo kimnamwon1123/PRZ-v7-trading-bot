@@ -27,7 +27,7 @@ Pine Script "WONEY PRZ STELLAR 실전v3" 100% 동일 구현
      - showShort 마스터 스위치, useBothEngines/상위TF추세/MFI강화/양봉마감 토글 지원
 작성: 지금까지
 """
-
+  
 import os
 ##os.remove('signals_PRZ_v7_Star.db')
 import sys
