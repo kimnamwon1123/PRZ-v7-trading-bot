@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+prz_v7_star_scanner.py 패치 스크립트 (v2)
+=========================================
+
+적용 내용 (4가지)
+  1. 숏 시그널 표기  : "🔴 PRZ 숏(매도) 시그널"  →  "🎯 PRZ 숏(익절) 추천자리"
+  2. 암호화폐 표기   : "[코인]"                  →  "[암호화폐]"
+  3. 가격 기준 변경  : 종가(Close)               →  캔들 몸통 중간 (Open+Close)/2
+                       (scan_symbol / scan_crypto_symbol / scan_futures_symbol 3곳)
+  4. 스캔 스케줄     : 12시간 고정 주기          →  매일 KST 07:00 / 19:00 (±30분 랜덤)
+
+사용법 (PythonAnywhere Bash 콘솔)
+  cd ~
+  python3 patch_scanner.py
+
+  ※ 원본은 prz_v7_star_scanner.py.bak 으로 자동 백업됩니다.
+  ※ 되돌리려면:  cp prz_v7_star_scanner.py.bak prz_v7_star_scanner.py
+
+작성: 지금까지
+"""
+
+import os
+import shutil
+import sys
+
+TARGET = "prz_v7_star_scanner.py"
+BACKUP = TARGET + ".bak"
+
+# ---------------------------------------------------------------------------
+# ④ 스캔 스케줄러 코드 (main() 앞에 삽입됨)
+# ---------------------------------------------------------------------------
+SCHEDULER_CODE = '''# ============================================================================
+# ⭐ 스캔 스케줄러 (고정 시각 + 랜덤 지터)
+# ============================================================================
+def sleep_until_next_scan():
+    """
+    다음 스캔 시각(KST)까지 대기.
+
+    - SCAN_HOURS_KST 에 지정된 시각 중 가장 가까운 미래 시각을 목표로 삼음
+    - JITTER_MINUTES 만큼 랜덤 지연을 더해 발송 시각이 매번 조금씩 달라지게 함
+      (12시간 고정 주기일 때 생기던 "항상 같은 시간대 도착" 패턴 제거)
+    """
+    kst = pytz.timezone('Asia/Seoul')
+    now = datetime.now(kst)
+
+    candidates = []
+    for day_offset in (0, 1):
+        base = now + timedelta(days=day_offset)
+        for h in SCAN_HOURS_KST:
+            t = base.replace(hour=h, minute=0, second=0, microsecond=0)
+            if t > now:
+                candidates.append(t)
+
+    if not candidates:
+        # 이론상 도달하지 않지만, 안전장치로 12시간 후 재시도
+        logger.warning("⚠️ 다음 스캔 시각 계산 실패 → 12시간 후 재시도")
+        time.sleep(43200)
+        return
+
+    target = min(candidates)
+    if JITTER_MINUTES > 0:
+        target += timedelta(minutes=random.randint(0, JITTER_MINUTES))
+
+    wait = (target - now).total_seconds()
+    wait = max(60, wait)   # 최소 1분 (즉시 재스캔 방지)
+
+    logger.info(
+        f"⏳ 다음 스캔 예정: {target.strftime('%Y-%m-%d %H:%M')} KST "
+        f"({wait / 3600:.1f}시간 후)"
+    )
+    time.sleep(wait)
+
+
+# ============================================================================
+# 메인 루프
+# ============================================================================
+def main():'''
+
+# ---------------------------------------------------------------------------
+# 치환 규칙: (설명, 찾을 문자열, 바꿀 문자열, 예상 등장 횟수)
+# ---------------------------------------------------------------------------
+RULES = [
+    (
+        "① 숏 시그널 → 익절 추천자리",
+        'signal_str = "🔴 PRZ 숏(매도) 시그널"',
+        'signal_str = "🎯 PRZ 숏(익절) 추천자리"',
+        1,
+    ),
+    (
+        "② [코인] → [암호화폐]",
+        'market = "[코인]"',
+        'market = "[암호화폐]"',
+        1,
+    ),
+    (
+        "③ 가격 기준: 종가 → 캔들 몸통 중간",
+        "current_price = ohlc_slice.iloc[-1]['Close']",
+        "current_price = (ohlc_slice.iloc[-1]['Open'] + ohlc_slice.iloc[-1]['Close']) / 2",
+        3,
+    ),
+    (
+        "④-1 random 모듈 import 추가",
+        "import time\nimport sqlite3",
+        "import time\nimport random\nimport sqlite3",
+        1,
+    ),
+    (
+        "④-2 스캔 시각 설정 추가",
+        "SCAN_INTERVAL = 43200  # ⭐ 12시간 (43200초) — 하루 2번, 주식 일봉 위주 + 최근 2봉 판정으로 누락 방지",
+        "SCAN_INTERVAL = 43200  # (미사용) 기존 고정 주기 — 아래 SCAN_HOURS_KST 스케줄로 대체됨\n\n"
+        "# ⭐⭐ 스캔 시각 (KST 기준, 하루 2회)\n"
+        "#   07:00 → 미국장 마감(한국시간 새벽 5~6시) 직후 = 미국 일봉 확정 반영\n"
+        "#   19:00 → 한국장 마감(오후 3시 30분) 이후    = 한국 일봉 확정 반영\n"
+        "SCAN_HOURS_KST = [7, 19]\n\n"
+        "# ⭐ 발송 시각 분산용 랜덤 지터 (분). 0이면 정각 고정.\n"
+        "#   '항상 같은 시간대에만 알람이 온다'는 인상을 줄이기 위함\n"
+        "JITTER_MINUTES = 30",
+        1,
+    ),
+    (
+        "④-3 스캔 스케줄러 함수 삽입",
+        "# ============================================================================\n"
+        "# 메인 루프\n"
+        "# ============================================================================\n"
+        "def main():",
+        SCHEDULER_CODE,
+        1,
+    ),
+    (
+        "④-4 시작 로그 문구 변경",
+        'logger.info(f"   스캔주기: {SCAN_INTERVAL}초 ({SCAN_INTERVAL // 3600}시간)")',
+        'logger.info(f"   스캔시각(KST): {\', \'.join(f\'{h:02d}:00\' for h in SCAN_HOURS_KST)} '
+        '(랜덤 지터 최대 {JITTER_MINUTES}분)")',
+        1,
+    ),
+    (
+        "④-5 메인 루프 대기 로직 교체",
+        'logger.info(f"⏳ {SCAN_INTERVAL}초({SCAN_INTERVAL // 3600}시간) 대기 중...")\n'
+        "            time.sleep(SCAN_INTERVAL)",
+        "sleep_until_next_scan()",
+        1,
+    ),
+]
+
+
+def main():
+    if not os.path.exists(TARGET):
+        print(f"❌ 파일을 찾을 수 없습니다: {TARGET}")
+        print("   스크립트를 prz_v7_star_scanner.py 와 같은 폴더에서 실행하세요.")
+        sys.exit(1)
+
+    with open(TARGET, "r", encoding="utf-8") as f:
+        src = f.read()
+
+    # ----- 1단계: 사전 검사 (하나라도 안 맞으면 아무것도 바꾸지 않음) -----
+    print("=" * 60)
+    print("🔍 패치 대상 확인 중...")
+    print("=" * 60)
+
+    problems = []
+    for desc, old, new, expected in RULES:
+        found = src.count(old)
+        already = src.count(new)
+
+        if found == 0 and already > 0:
+            print(f"  ⏭️  {desc} — 이미 적용됨 (건너뜀)")
+            continue
+
+        if found == 0:
+            problems.append(f"{desc}: 대상 문자열을 찾지 못했습니다.")
+            print(f"  ❌ {desc} — 대상 없음")
+            continue
+
+        if expected and found != expected:
+            problems.append(
+                f"{desc}: {expected}곳을 예상했으나 {found}곳 발견 (수동 확인 필요)"
+            )
+            print(f"  ⚠️  {desc} — {found}곳 발견 (예상 {expected}곳)")
+            continue
+
+        print(f"  ✅ {desc} — {found}곳 발견")
+
+    if problems:
+        print()
+        print("=" * 60)
+        print("⛔ 패치를 중단합니다. 아래 항목을 확인하세요:")
+        for p in problems:
+            print(f"   - {p}")
+        print("=" * 60)
+        print("파일은 전혀 변경되지 않았습니다.")
+        sys.exit(1)
+
+    # ----- 2단계: 백업 -----
+    shutil.copy2(TARGET, BACKUP)
+    print()
+    print(f"💾 백업 완료: {BACKUP}")
+
+    # ----- 3단계: 치환 -----
+    out = src
+    total = 0
+    for desc, old, new, expected in RULES:
+        cnt = out.count(old)
+        if cnt:
+            out = out.replace(old, new)
+            total += cnt
+
+    with open(TARGET, "w", encoding="utf-8") as f:
+        f.write(out)
+
+    print(f"✏️  총 {total}곳 수정 완료")
+
+    # ----- 4단계: 문법 검사 -----
+    print()
+    print("=" * 60)
+    print("🧪 문법 검사 중...")
+    try:
+        compile(out, TARGET, "exec")
+        print("  ✅ 문법 이상 없음")
+    except SyntaxError as e:
+        print(f"  ❌ 문법 오류 발생: {e}")
+        shutil.copy2(BACKUP, TARGET)
+        print("  ↩️  백업에서 자동 복구했습니다. 파일은 원래대로입니다.")
+        sys.exit(1)
+
+    print("=" * 60)
+    print()
+    print("🎉 패치 완료!")
+    print()
+    print("변경 요약")
+    print("-" * 60)
+    print("  숏 표기    : 🔴 PRZ 숏(매도) 시그널 → 🎯 PRZ 숏(익절) 추천자리")
+    print("  암호화폐   : [코인] → [암호화폐]")
+    print("  가격 기준  : 종가 → 캔들 몸통 중간 (시가+종가)/2")
+    print("  스캔 시각  : 12시간 고정 → KST 07:00 / 19:00 (±30분 랜덤)")
+    print("-" * 60)
+    print()
+    print("⚠️  Always-on Task를 재시작해야 반영됩니다.")
+
+
+if __name__ == "__main__":
+    main()
