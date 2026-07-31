@@ -29,7 +29,7 @@ Pine Script "WONEY PRZ STELLAR 실전v3" 100% 동일 구현
 """
 
 import os
-##os.remove('signals_PRZ_v7_Star.db')
+os.remove('signals_PRZ_v7_Star.db')
 import sys
 import time
 import sqlite3
@@ -68,8 +68,8 @@ INDICATOR_NAME = "PRZ_v7_Star"          # ⭐ 통합 버전 (DB/로그 새로 �
 DB_NAME = f"signals_{INDICATOR_NAME}.db"
 LOG_NAME = f"{INDICATOR_NAME}.log"
 #SCAN_INTERVAL = 21000  # 5시간
-#SCAN_INTERVAL = 28800  # 8시간
-SCAN_INTERVAL = 43200  # ⭐ 12시간 (43200초) — 하루 2번, 주식 일봉 위주 + 최근 2봉 판정으로 누락 방지
+SCAN_INTERVAL = 28800  # 8시간
+#SCAN_INTERVAL = 43200  # ⭐ 12시간 (43200초) — 하루 2번, 주식 일봉 위주 + 최근 2봉 판정으로 누락 방지
 
 # ⭐⭐ 시그널 판정 시 최근 몇 개의 '확정된' 캔들을 확인할지
 #     1 = 마지막 확정봉만 (기존), 2 = 마지막 확정봉 + 그 직전봉
@@ -79,8 +79,8 @@ SIGNAL_LOOKBACK_BARS = 2
 
 # Telegram
 TELEGRAM_TOKEN = "8563657580:AAHBN-NXGIdLSeWc4BEeQYnh-qOa7U0ar50"
-# TELEGRAM_CHAT_ID = "-1004341977618"
-TELEGRAM_CHAT_ID = "5224743593"
+TELEGRAM_CHAT_ID = "-1004341977618"
+# TELEGRAM_CHAT_ID = "5224743593"
 
 # ⭐ qual_value (PRZ 신호 정확도, 범위 2~15, 기본 6.0)
 QUAL_VALUE = 6.0
@@ -148,16 +148,14 @@ LOOKBACK_INTRADAY = 400   # 8h용 1h 수집: 400일치 (yfinance 1h 한도 730�
 SCAN_CRYPTO = True
 # ⭐ 메이저 코인 8개 (거래량/시총 상위, yfinance 심볼)
 CRYPTO_SYMBOLS = [
-    # ===== 기존 20종 (거래량 상위 메이저) =====
+    # ⭐ 거래량/시총 상위 18종만 유지 (8h 안정 스캔 + CPU 절감)
     'BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD',
     'BNB-USD', 'DOGE-USD', 'ADA-USD', 'LINK-USD',
     'AVAX-USD', 'TRX-USD', 'LTC-USD', 'BCH-USD',
-    'DOT-USD', 'UNI-USD', 'ATOM-USD', 'NEAR-USD',
-    'TON-USD', 'APT-USD', 'XLM-USD', 'HBAR-USD',
-    # ⭐⭐ 신규 추가 10종 (거래량 상위 · 미국주식 CPU 절감분 활용)
-    'SUI-USD', 'SHIB-USD', 'PEPE-USD', 'ARB-USD', 'OP-USD',
-    'FIL-USD', 'ETC-USD', 'ICP-USD', 'AAVE-USD',
-]  # TAO-USD 제거: 야후 1h 미제공 + 일봉 데이터도 부족(신규 상장)
+    'DOT-USD', 'XLM-USD', 'HBAR-USD', 'SHIB-USD',
+    'AAVE-USD', 'ICP-USD',
+]
+# 제거(11종): UNI/APT/SUI/PEPE(야후 1h 미제공) + ATOM/NEAR/TON/ARB/OP/FIL/ETC(거래량 하위)
 CRYPTO_TIMEFRAMES = ['8h', '1d']          # 8시간봉, 일봉
 # ⭐ 8h 리샘플용 1h 데이터 조회 기간
 #    720일로 설정 시 yfinance 내부 버그(_NoValueType TypeError)로 다운로드 실패
@@ -270,10 +268,31 @@ DAILY_ONLY_SYMBOLS = [
     'AR', 'RRC', 'CVE', 'TRP',
     # 사모펀드/자산운용
     'ARES', 'OWL', 'CG',
+
+    # ⭐⭐ 3차 추가 21종 (코인 11 + 한국 10 축소분 → 미국 거래량 상위로 대체)
+    # 대형 ADR
+    'WIT', 'DB', 'BBVA', 'TME',
+    # AI/반도체 고거래량
+    'LSCC', 'CRDO', 'ALAB', 'WOLF',
+    # 바이오/헬스케어
+    'BNTX', 'EXAS', 'GH',
+    # 소비재 성장주
+    'ELF', 'CAVA', 'WING', 'BROS',
+    # 핀테크
+    'DAVE', 'BILL', 'FOUR',
+    # 크립토 마이닝/고거래량
+    'IREN', 'WULF', 'GME',
 ]
 
 # ⭐ 미국주식 티커 → 한글 회사명 매핑 (텔레그램 표시용, 영어티커(한글명) 형식)
 US_STOCK_NAMES = {
+    # ⭐⭐ 3차 추가 종목명
+    'WIT': '위프로', 'DB': '도이체방크', 'BBVA': 'BBVA', 'TME': '텐센트뮤직',
+    'LSCC': '래티스반도체', 'CRDO': '크레도테크', 'ALAB': '아스테라랩스', 'WOLF': '울프스피드',
+    'BNTX': '바이오엔텍', 'EXAS': '이그잭트사이언스', 'GH': '가던트헬스',
+    'ELF': '엘프뷰티', 'CAVA': '카바그룹', 'WING': '윙스탑', 'BROS': '더치브로스',
+    'DAVE': '데이브', 'BILL': '빌홀딩스', 'FOUR': '쉬프트4페이먼츠',
+    'IREN': '아이런', 'WULF': '테라울프', 'GME': '게임스탑',
     # ⭐⭐ 2차 추가 종목명
     'ENPH': '엔페이즈', 'ASX': 'ASE테크', 'PATH': '유아이패스', 'GTLB': '깃랩',
     'ESTC': '일래스틱', 'S': '센티넬원', 'CFLT': '컨플루언트', 'FROG': 'J프로그',
@@ -713,7 +732,7 @@ def send_telegram(symbol, timeframe, signal_type, current_price, total_signals,
 
     try:
         if is_crypto:
-            market = "[코인]"
+            market = "[암호화폐]"
         elif is_futures:
             market = "[해외선물]"
         elif is_korean:
@@ -1830,16 +1849,7 @@ def get_korean_stocks():
         '017800',  # 현대엘리베이터
         '011210',  # 현대위아
         '204320',  # HL만도
-        '073240',  # 금호타이어
-        '103140',  # 풍산
-        '120110',  # 코오롱인더
-        '298020',  # 효성티앤씨
-        '052690',  # 한전기술
-        '082740',  # 한화엔진
-        '018670',  # SK가스
-        '093050',  # LX인터내셔널
-        '361610',  # SK아이이테크놀로지
-        '450080',  # 에코프로머티
+        # ⭐ 거래량 하위 10종 제거(073240 금호타이어 ~ 450080 에코프로머티) → 미국 대형주로 대체
     ]
 
     # ⭐⭐ 필수 포함 종목 병합 (중복 제거, 순서 유지)
@@ -2170,7 +2180,8 @@ def scan_symbol(detector, symbol, is_korean=False, daily_only=False):
 
             if signal_type != 'NEUTRAL':
                 prev_candle_time = str(ohlc_slice.index[-1])
-                current_price = ohlc_slice.iloc[-1]['Close']
+                # ⭐ 가격 기준: 캔들 몸통 중간 (시가+종가)/2
+                current_price = (ohlc_slice.iloc[-1]['Open'] + ohlc_slice.iloc[-1]['Close']) / 2
 
                 last_signal_time = get_last_signal_time(symbol, tf, signal_type)
 
@@ -2226,7 +2237,8 @@ def scan_crypto_symbol(detector, symbol):
 
             if signal_type != 'NEUTRAL':
                 prev_candle_time = str(ohlc_slice.index[-1])
-                current_price = ohlc_slice.iloc[-1]['Close']
+                # ⭐ 가격 기준: 캔들 몸통 중간 (시가+종가)/2
+                current_price = (ohlc_slice.iloc[-1]['Open'] + ohlc_slice.iloc[-1]['Close']) / 2
 
                 last_signal_time = get_last_signal_time(symbol, tf, signal_type)
 
@@ -2281,7 +2293,8 @@ def scan_futures_symbol(detector, symbol):
 
             if signal_type != 'NEUTRAL':
                 prev_candle_time = str(ohlc_slice.index[-1])
-                current_price = ohlc_slice.iloc[-1]['Close']
+                # ⭐ 가격 기준: 캔들 몸통 중간 (시가+종가)/2
+                current_price = (ohlc_slice.iloc[-1]['Open'] + ohlc_slice.iloc[-1]['Close']) / 2
 
                 last_signal_time = get_last_signal_time(symbol, tf, signal_type)
 
